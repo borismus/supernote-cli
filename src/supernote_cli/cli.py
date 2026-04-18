@@ -64,7 +64,11 @@ def _build_parser() -> argparse.ArgumentParser:
     "-o",
     "--out",
     default=".",
-    help="(render only) directory to save rendered PNG into (default: CWD)",
+    help=(
+      "(render only) output path. If it ends with .png, it is the target "
+      "filename (only valid with a single ID). Otherwise it is treated as "
+      "a directory and PNGs are named {digest_id}.png. Default: CWD."
+    ),
   )
   pd.add_argument(
     "--no-annotation",
@@ -196,6 +200,17 @@ def _digest_list_impl(args) -> int:
 def _digest_render_impl(args) -> int:
   c = _client_from_args(args)
   ids = [i.strip() for i in args.target.split(",") if i.strip()]
+
+  out_path = Path(args.out)
+  as_file = out_path.suffix.lower() == ".png"
+  if as_file and len(ids) > 1:
+    print(
+      f"error: -o {args.out} looks like a filename but you passed "
+      f"{len(ids)} digest IDs; use a directory path or a single ID",
+      file=sys.stderr,
+    )
+    return 2
+
   digests = api.fetch_digests_by_ids(c, ids)
 
   if args.as_json:
@@ -209,38 +224,48 @@ def _digest_render_impl(args) -> int:
   if args.no_annotation:
     return 0
 
-  out_dir = Path(args.out)
-  out_dir.mkdir(parents=True, exist_ok=True)
   for d in digests:
-    written = api.render_handwriting(c, d, out_dir, force=args.force)
+    written = api.render_handwriting(c, d, out_path, force=args.force)
     if written:
       for p in written:
         print(f"rendered: {p}", file=sys.stderr)
       continue
     # Empty list: either already-existed-and-not-forced, or no annotation
     if d.raw.get("commentHandwriteName"):
-      # Had annotation; must have skipped because files exist
-      total = _expected_page_count(out_dir, d.id)
-      if total:
-        for i in range(1, total + 1):
-          suffix = "" if total == 1 else f"_p{i}"
-          print(f"already exists: {out_dir / f'{d.id}{suffix}.png'}", file=sys.stderr)
-      else:
-        print(f"already exists: {out_dir / f'{d.id}.png'}", file=sys.stderr)
+      existing = _existing_render_paths(out_path, d.id, as_file)
+      for p in existing:
+        print(f"already exists: {p}", file=sys.stderr)
+      if not existing:
+        # Rare: had annotation but render returned nothing and no files exist
+        print(f"no annotation for {d.id}", file=sys.stderr)
     else:
       print(f"no annotation for {d.id}", file=sys.stderr)
   return 0
 
 
-def _expected_page_count(out_dir: Path, digest_id: str) -> int:
-  """How many PNG pages are already on disk for this digest."""
-  single = out_dir / f"{digest_id}.png"
+def _existing_render_paths(out_path: Path, digest_id: str, as_file: bool) -> list[Path]:
+  """Enumerate already-on-disk PNG outputs for a digest at this out_path."""
+  if as_file:
+    if out_path.exists():
+      return [out_path]
+    # multi-page sibling pattern
+    stem, suffix = out_path.stem, out_path.suffix
+    found = []
+    n = 0
+    while (sib := out_path.with_name(f"{stem}_p{n + 1}{suffix}")).exists():
+      found.append(sib)
+      n += 1
+    return found
+  # directory mode
+  single = out_path / f"{digest_id}.png"
   if single.exists():
-    return 1
+    return [single]
+  found = []
   n = 0
-  while (out_dir / f"{digest_id}_p{n + 1}.png").exists():
+  while (p := out_path / f"{digest_id}_p{n + 1}.png").exists():
+    found.append(p)
     n += 1
-  return n
+  return found
 
 
 def _note_dict(n) -> dict:

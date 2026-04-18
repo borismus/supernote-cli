@@ -353,3 +353,34 @@ def test_30_cli_digest_already_exists(client: Client, tmp_path: Path):
   assert r2.returncode == 0
   assert "already exists:" in r2.stderr
   assert "rendered:" not in r2.stderr
+
+
+def test_31_render_handwriting_file_path(client: Client, tmp_path: Path):
+  """`out` ending in .png should be used as the target filename directly."""
+  d = _first_digest_with_annotation(client)
+  target = tmp_path / "my_annotation.png"
+  paths = api.render_handwriting(client, d, target)
+  assert paths == [target] or (paths and paths[0] == target)
+  assert target.exists()
+  assert target.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_32_cli_digest_file_path_output(client: Client, tmp_path: Path):
+  """`supernote digest <id> -o foo.png` writes to foo.png, not foo.png/<id>.png."""
+  d = _first_digest_with_annotation(client)
+  target = tmp_path / "tmp.png"
+  r = _run_cli("digest", d.id, "-o", str(target))
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  assert target.exists(), f"expected {target}; got tree: {list(tmp_path.iterdir())}"
+  assert target.is_file(), f"{target} should be a file, not a directory"
+  # No {digest_id}.png inside should exist — that would be the old buggy behavior
+  buggy = target / f"{d.id}.png"
+  assert not buggy.exists(), "regression: CLI created a dir with digest_id.png inside"
+
+
+def test_33_cli_digest_file_path_multi_id_errors(client: Client, tmp_path: Path):
+  d = _first_digest_with_annotation(client)
+  target = tmp_path / "tmp.png"
+  r = _run_cli("digest", f"{d.id},{d.id}", "-o", str(target))
+  assert r.returncode != 0
+  assert "looks like a filename" in r.stderr or "multiple" in r.stderr.lower() or "digest IDs" in r.stderr

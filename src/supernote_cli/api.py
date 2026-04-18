@@ -169,19 +169,23 @@ def fetch_handwriting_url(client: Client, digest_id: str | int) -> str | None:
 def render_handwriting(
   client: Client,
   digest: Digest,
-  out_dir: str | os.PathLike = ".",
+  out: str | os.PathLike = ".",
   *,
   force: bool = False,
 ) -> list[Path]:
   """Fetch the per-highlight handwriting for a digest and render each page to PNG.
 
+  `out` may be either:
+    - a directory (default) — files are named `{digest_id}.png`, or
+      `{digest_id}_p{N}.png` (1-indexed) for multi-page
+    - a `.png` file path — used directly for single-page handwriting;
+      for multi-page, siblings `{stem}_p{N}.png` are written next to it
+
   Returns the list of written PNG paths. Empty list if:
     - the digest has no commentHandwriteName (highlight with no annotation), or
     - every target PNG already exists and force is False.
 
-  Files are named `{digest_id}.png` for single-page handwriting, or
-  `{digest_id}_p{N}.png` (1-indexed) for multi-page. Existing files are
-  skipped unless `force=True`.
+  Existing files are skipped unless `force=True`.
   """
   from supernotelib import load_notebook
   from supernotelib.converter import ImageConverter
@@ -192,8 +196,8 @@ def render_handwriting(
   if not url:
     return []
 
-  out = Path(out_dir)
-  out.mkdir(parents=True, exist_ok=True)
+  out_path = Path(out)
+  as_file = out_path.suffix.lower() == ".png"
   mark_bytes = client.get_binary(url)
 
   with tempfile.NamedTemporaryFile(suffix=".mark") as tmp:
@@ -205,8 +209,15 @@ def render_handwriting(
 
     written: list[Path] = []
     for i in range(total):
-      suffix = "" if total == 1 else f"_p{i + 1}"
-      dest = out / f"{digest.id}{suffix}.png"
+      if as_file:
+        if total == 1:
+          dest = out_path
+        else:
+          dest = out_path.with_name(f"{out_path.stem}_p{i + 1}{out_path.suffix}")
+      else:
+        suffix = "" if total == 1 else f"_p{i + 1}"
+        dest = out_path / f"{digest.id}{suffix}.png"
+      dest.parent.mkdir(parents=True, exist_ok=True)
       if dest.exists() and not force:
         continue
       img = converter.convert(i)
