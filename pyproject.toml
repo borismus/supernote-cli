@@ -1,0 +1,30 @@
+[project]
+name = "supernote-cli"
+version = "0.1.0"
+description = "CLI and Python client for the Supernote viewer.supernote.com cloud API"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Boris Smus", email = "boris@smus.com" }]
+license = { text = "MIT" }
+dependencies = [
+  "requests>=2.31",
+  "python-dotenv>=1.0",
+  "supernotelib>=0.6.2",
+  "pillow",
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "pytest"]
+
+[project.scripts]
+supernote = "supernote_cli.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+indent-width = 2
+
+[tool.ruff.format]
+indent-style = "space"
