@@ -88,6 +88,7 @@ for p in pages:
 
 - v0.1: cloud API (login, ls, download, sync, source/digest listing, annotation rendering).
 - `.note` OCR: `list_notes`, `render_note`, `extract_note_text`, `ocr_note` (local file), `ocr_note_from_cloud` (by file id), `ocr_image` in `supernote_cli.api` / `supernote_cli.ocr`; plus `supernote note ls` and `supernote note <file-id>` CLI verbs. Requires Ollama running locally with a vision model pulled (default `qwen3-vl:8b`).
+- Not yet on PyPI. Install via `uv tool install git+https://github.com/borismus/supernote-cli` or add a local path dep (`{ path = "…", editable = true }`). Planned to publish after living with the API for a bit — see the publish playbook in [docs/publishing.md](docs/publishing.md).
 
 ## Tests
 
