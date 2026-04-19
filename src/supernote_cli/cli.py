@@ -6,8 +6,6 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict
-from datetime import datetime
 from pathlib import Path
 
 from . import api, tokenstore
@@ -56,9 +54,7 @@ def _build_parser() -> argparse.ArgumentParser:
     type=int,
     help="(ls only) only include sources with digests modified within N days",
   )
-  ps.add_argument(
-    "--limit", type=int, default=50, help="(ls only) max sources to show"
-  )
+  ps.add_argument("--limit", type=int, default=50, help="(ls only) max sources to show")
 
   pd = sub.add_parser(
     "digest",
@@ -76,9 +72,7 @@ def _build_parser() -> argparse.ArgumentParser:
   )
   pd.add_argument("--json", dest="as_json", action="store_true")
   # ls-only
-  pd.add_argument(
-    "--limit", type=int, default=20, help="(ls only) max records to show"
-  )
+  pd.add_argument("--limit", type=int, default=20, help="(ls only) max records to show")
   # render-only
   pd.add_argument(
     "-o",
@@ -192,8 +186,7 @@ def _cmd_source(args) -> int:
   if args.target == "ls":
     return _source_list_impl(args)
   print(
-    f"error: unknown source target '{args.target}'. "
-    "Try `supernote source ls`.",
+    f"error: unknown source target '{args.target}'. Try `supernote source ls`.",
     file=sys.stderr,
   )
   return 2
@@ -210,11 +203,7 @@ def _source_list_impl(args) -> int:
     print("(no digested sources)")
     return 0
   for s in sources:
-    print(
-      f"{len(s.digests):>4}  "
-      f"{s.latest_modified.strftime('%Y-%m-%d')}  "
-      f"{s.source_path}"
-    )
+    print(f"{len(s.digests):>4}  {s.latest_modified.strftime('%Y-%m-%d')}  {s.source_path}")
   return 0
 
 
@@ -366,7 +355,10 @@ def main(argv: list[str] | None = None) -> int:
     return _DISPATCH[args.cmd](args)
   except AuthRequired as e:
     print(f"error: {e}", file=sys.stderr)
-    print("set SUPERNOTE_USER and SUPERNOTE_PASSWORD in .env, then run: supernote login", file=sys.stderr)
+    print(
+      "set SUPERNOTE_USER and SUPERNOTE_PASSWORD in .env, then run: supernote login",
+      file=sys.stderr,
+    )
     return 2
   except ApiError as e:
     code = f" [{e.code}]" if e.code else ""

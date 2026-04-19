@@ -35,9 +35,7 @@ def resolve_path(client: Client, path: str) -> tuple[str | int, list[Note]]:
   directory_id: str | int = 0
   contents = list_files(client, directory_id)
   for i, part in enumerate(parts):
-    match = next(
-      (n for n in contents if n.is_folder and n.file_name == part), None
-    )
+    match = next((n for n in contents if n.is_folder and n.file_name == part), None)
     if match is None:
       walked = "/".join(parts[:i]) or "(root)"
       raise ApiError(f"path component '{part}' not found under {walked}")
@@ -207,9 +205,7 @@ def list_digested_sources(
 
   out: list[SourceDigests] = []
   for path, group in grouped.items():
-    group.sort(
-      key=lambda d: d.last_modified_time or dt.datetime.min, reverse=True
-    )
+    group.sort(key=lambda d: d.last_modified_time or dt.datetime.min, reverse=True)
     latest = max(
       (d.last_modified_time for d in group if d.last_modified_time),
       default=dt.datetime.min,
@@ -232,9 +228,7 @@ def fetch_handwriting_url(client: Client, digest_id: str | int) -> str | None:
   Returns None if the digest has no associated handwriting (the highlight
   was never annotated). Other errors raise.
   """
-  data = client._post(
-    "file/download/summary", {"id": digest_id}, include_channel=True
-  )
+  data = client._post("file/download/summary", {"id": digest_id}, include_channel=True)
   return data.get("url")
 
 

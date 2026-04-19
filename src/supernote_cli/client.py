@@ -70,9 +70,7 @@ class Client:
 
   def login(self) -> str:
     if not self.account or not self._password:
-      raise AuthRequired(
-        "SUPERNOTE_USER and SUPERNOTE_PASSWORD must be set in .env or environment"
-      )
+      raise AuthRequired("SUPERNOTE_USER and SUPERNOTE_PASSWORD must be set in .env or environment")
     self.token = auth.login(self.account, self._password, equipment_no=self.equipment_no)
     if not self.no_cache:
       tokenstore.save(self.token, self.account)
@@ -114,11 +112,11 @@ class Client:
 
     try:
       data = r.json()
-    except ValueError:
+    except ValueError as e:
       raise ApiError(
         f"non-JSON response from {path}: HTTP {r.status_code} {r.text[:200]}",
         status=r.status_code,
-      )
+      ) from e
 
     # Some endpoints return 200 with success=false + errorCode=E0401 for expired tokens
     if data.get("errorCode") == "E0401" and _retry and self._password:

@@ -52,9 +52,7 @@ class Digest:
   raw: dict
 
   @classmethod
-  def from_api(
-    cls, data: dict, *, last_modified_time: datetime | None = None
-  ) -> "Digest":
+  def from_api(cls, data: dict, *, last_modified_time: datetime | None = None) -> "Digest":
     mt = last_modified_time
     if mt is None:
       ts = data.get("lastModifiedTime")

@@ -35,8 +35,8 @@ def _post(path: str, payload: dict, headers: dict, timeout: int = 30) -> dict:
   r = requests.post(API_BASE + path, json=payload, headers=headers, timeout=timeout)
   try:
     data = r.json()
-  except ValueError:
-    raise AuthError(f"non-JSON response from {path}: HTTP {r.status_code} {r.text[:200]}")
+  except ValueError as e:
+    raise AuthError(f"non-JSON response from {path}: HTTP {r.status_code} {r.text[:200]}") from e
   return data
 
 

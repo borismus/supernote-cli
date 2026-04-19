@@ -9,10 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import stat
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -92,7 +90,6 @@ def test_06_ls_root(client: Client):
 def test_07_ls_note_folder(client: Client):
   _, contents = api.resolve_path(client, "Note")
   assert len(contents) > 0
-  files = [n for n in contents if not n.is_folder]
   # Not asserting there must be files (could be all folders), but fields must decode
   for n in contents[:5]:
     assert n.id
@@ -317,6 +314,7 @@ def test_26_render_handwriting_force_rewrites(client: Client, tmp_path: Path):
   assert first
   before = {p: p.stat().st_mtime_ns for p in first}
   import time as _time
+
   _time.sleep(0.01)
   rewritten = api.render_handwriting(client, d, tmp_path, force=True)
   assert rewritten == first, "force should rewrite the same page(s)"
@@ -390,7 +388,11 @@ def test_33_cli_digest_file_path_multi_id_errors(client: Client, tmp_path: Path)
   target = tmp_path / "tmp.png"
   r = _run_cli("digest", f"{d.id},{d.id}", "-o", str(target))
   assert r.returncode != 0
-  assert "looks like a filename" in r.stderr or "multiple" in r.stderr.lower() or "digest IDs" in r.stderr
+  assert (
+    "looks like a filename" in r.stderr
+    or "multiple" in r.stderr.lower()
+    or "digest IDs" in r.stderr
+  )
 
 
 # ---------- Sources ----------

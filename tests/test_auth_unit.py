@@ -220,9 +220,7 @@ def test_list_digested_sources_days_ago_filter():
   assert len(sources) == 1
   assert sources[0].source_path == "/Document/R.pdf"
   # Only the recent id should have been fetched
-  summary_call = next(
-    p for path, p in c.calls if path == "file/query/summary/id"
-  )
+  summary_call = next(p for path, p in c.calls if path == "file/query/summary/id")
   assert summary_call["ids"] == ["recent"]
 
 
