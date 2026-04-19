@@ -63,21 +63,26 @@ from supernote_cli import Client, api
 
 c = Client.from_env()             # loads .env + cached token
 
-dir_id, contents = api.resolve_path(c, "Note")
-for note in contents:
-    if not note.is_folder:
-        print(note.file_name, note.size)
+# List .note files under /Note/ (recursive)
+for folder_path, note in api.list_notes(c):
+    print(note.id, f"{folder_path}/{note.file_name}")
 
-digests = api.fetch_digests_by_ids(c, [h.id for h in api.fetch_digest_hashes(c, size=5)])
+# Group digests by source document (PDF/EPUB) and get full Digest records
+for src in api.list_digested_sources(c, days_ago=30):
+    print(src.source_stem, len(src.digests))
+    # Render each digest's handwritten annotation to PNG
+    for d in src.digests:
+        paths = api.render_handwriting(c, d, out="/tmp/hw")
+        if paths:
+            print(d.id, "->", paths)
 
-# Render the handwritten annotation for a digest to PNG
-for d in digests:
-    paths = api.render_handwriting(c, d, out_dir="/tmp/hw")
-    if paths:
-        print(d.id, "->", paths)
+# Download + render + Ollama-OCR a .note by cloud id
+pages = api.ocr_note_from_cloud(c, "1138647043762290688", "/tmp/wh")
+for p in pages:
+    print(p.index, p.ocr_text)
 ```
 
-`Client` handles auth transparently: an expired token triggers a re-login if `.env` credentials are available. Rendering uses `supernotelib` + `pillow` (main deps).
+`Client` handles auth transparently: an expired token triggers a re-login if `.env` credentials are available. Rendering uses `supernotelib` + `pillow` (main deps); OCR talks to a local Ollama daemon.
 
 ## Status
 
