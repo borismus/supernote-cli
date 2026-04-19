@@ -8,6 +8,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from . import ocr as _ocr
 from .client import ApiError, Client
 from .models import Digest, DigestHash, Note
 
@@ -292,3 +293,93 @@ def render_handwriting(
       img.save(dest)
       written.append(dest)
     return written
+
+
+@dataclass
+class NotePage:
+  index: int  # 1-based
+  png_path: Path
+  transcript: str | None  # supernotelib device-OCR (may be None)
+  ocr_text: str | None  # local Ollama OCR (None if disabled/failed)
+
+
+def render_note(
+  note_path: str | os.PathLike,
+  out_dir: str | os.PathLike,
+  *,
+  force: bool = False,
+) -> list[Path]:
+  """Render each page of a `.note` file to `page_{N}.png` (1-indexed).
+
+  Creates `out_dir` if needed. Skips existing PNGs unless `force=True`.
+  Returns the full list of page PNG paths (one per page, indexed by
+  page number), whether newly written or already on disk.
+  """
+  from supernotelib import load_notebook
+  from supernotelib.converter import ImageConverter
+
+  out_path = Path(out_dir)
+  out_path.mkdir(parents=True, exist_ok=True)
+
+  notebook = load_notebook(str(note_path))
+  total = notebook.get_total_pages()
+  converter = ImageConverter(notebook, palette=None)
+
+  paths: list[Path] = []
+  for i in range(total):
+    dest = out_path / f"page_{i + 1}.png"
+    paths.append(dest)
+    if dest.exists() and not force:
+      continue
+    img = converter.convert(i)
+    if img is None:
+      continue
+    img.save(dest)
+  return paths
+
+
+def extract_note_text(note_path: str | os.PathLike) -> list[str]:
+  """Return per-page device-OCR transcripts via supernotelib.
+
+  List length matches `notebook.get_total_pages()`. A page's entry is an
+  empty string if the device produced no transcript (or the converter
+  returned None).
+  """
+  from supernotelib import load_notebook
+  from supernotelib.converter import TextConverter
+
+  notebook = load_notebook(str(note_path))
+  total = notebook.get_total_pages()
+  converter = TextConverter(notebook, palette=None)
+  return [converter.convert(i) or "" for i in range(total)]
+
+
+def ocr_note(
+  note_path: str | os.PathLike,
+  out_dir: str | os.PathLike,
+  *,
+  model: str = _ocr.DEFAULT_MODEL,
+  force: bool = False,
+) -> list[NotePage]:
+  """Render a `.note` file's pages, pull device transcripts, OCR each page.
+
+  Bundles `render_note` + `extract_note_text` + `ocr_image` into one call.
+  If Ollama is unreachable, `ocr_text` is None on every page but the rest
+  of the record is still populated.
+  """
+  png_paths = render_note(note_path, out_dir, force=force)
+  transcripts = extract_note_text(note_path)
+
+  pages: list[NotePage] = []
+  for i, png in enumerate(png_paths):
+    transcript = transcripts[i] if i < len(transcripts) else ""
+    ocr_text = _ocr.ocr_image(png, model=model) if png.exists() else None
+    pages.append(
+      NotePage(
+        index=i + 1,
+        png_path=png,
+        transcript=transcript or None,
+        ocr_text=ocr_text,
+      )
+    )
+  return pages

@@ -35,12 +35,21 @@ supernote download <file-id> [-o PATH]                # download a single note f
 supernote sync <path> --out DIR \
          [--days-ago N] [--dry-run] [--recursive]
 
+supernote source ls [--days-ago N] [--limit N] [--json]  # list source docs that have digests
+
 supernote digest ls [--limit N] [--json]              # list digest records
 supernote digest <id>[,<id>...] \                     # print content AND render the
-         [-o DIR] [--no-annotation] [--force] [--json]   # handwritten annotation as PNG
+         [-o PATH] [--no-annotation] [--force] [--json]  # handwritten annotation as PNG
+
+supernote note ocr <path> \                           # render each page of a local .note
+         [-o DIR] [--model M] [--force] [--json]        # to PNG and run Ollama OCR
 ```
 
-`supernote digest <id>` prints the auto-transcribed content and renders the handwritten annotation (the note you drew on top of the highlighted passage) to `{out_dir}/{digest_id}.png`. Multi-page annotations produce `{digest_id}_p1.png`, `{digest_id}_p2.png`, etc. Existing PNGs are skipped unless `--force`. Digests without an annotation print `no annotation for {id}` to stderr and write no file. Use `--no-annotation` to print content only.
+`supernote digest <id>` prints the auto-transcribed content and renders the handwritten annotation (the note you drew on top of the highlighted passage) as PNG. `-o` can be either a directory (files named `{digest_id}.png`, default: CWD) or a `.png` path used as the target filename directly (single ID only). Multi-page annotations produce `{digest_id}_p1.png`, `{digest_id}_p2.png`, etc. (or `{stem}_p{N}.png` siblings in file-path mode). Existing PNGs are skipped unless `--force`. Digests without an annotation print `no annotation for {id}` to stderr and write no file. Use `--no-annotation` to print content only.
+
+`supernote source ls` groups digests by their source document (e.g. `/Document/MyBook.pdf`) and prints `{digest_count}  {latest_modified}  {source_path}`, most-recent first.
+
+`supernote note ocr <path>` renders each page of a local `.note` file to `page_{N}.png` and runs Ollama vision OCR on each (default model `qwen3-vl:8b`). Requires Ollama running locally; if unreachable, `ocr_text` comes back empty but page rendering still completes. Use `--json` for a structured per-page array.
 
 Global flags: `--no-cache`, `--verbose`, `--equipment-no`.
 
@@ -69,8 +78,8 @@ for d in digests:
 
 ## Status
 
-- v0.1: cloud API fetching (login, ls, download, sync, digest listing, annotation rendering).
-- v0.2 (planned): OCR of the rendered handwriting via local vision models.
+- v0.1: cloud API (login, ls, download, sync, source/digest listing, annotation rendering).
+- Local `.note` OCR via `render_note`, `extract_note_text`, `ocr_note`, `ocr_image` in `supernote_cli.api` / `supernote_cli.ocr`, plus the `supernote note ocr` CLI verb. Requires Ollama running locally with a vision model pulled (default `qwen3-vl:8b`).
 
 ## Tests
 

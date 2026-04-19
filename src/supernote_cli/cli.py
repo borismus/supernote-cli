@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import api, tokenstore
+from . import api, ocr, tokenstore
 from .client import ApiError, AuthRequired, Client
 
 
@@ -94,6 +94,34 @@ def _build_parser() -> argparse.ArgumentParser:
     "--force",
     action="store_true",
     help="(render only) overwrite existing PNG files",
+  )
+
+  pn = sub.add_parser(
+    "note",
+    help="operate on a local .note file (`note ocr <path>`)",
+    description=(
+      "With target 'ocr': render each page of a local .note file to PNG "
+      "and run Ollama vision OCR on each, printing the transcript per page."
+    ),
+  )
+  pn.add_argument("target", help="'ocr' to render+OCR a .note file")
+  pn.add_argument("path", help="path to a local .note file")
+  pn.add_argument("--json", dest="as_json", action="store_true")
+  pn.add_argument(
+    "-o",
+    "--out",
+    default=None,
+    help="output directory for page PNGs (default: ./{note_stem}/)",
+  )
+  pn.add_argument(
+    "--model",
+    default=ocr.DEFAULT_MODEL,
+    help=f"Ollama vision model (default: {ocr.DEFAULT_MODEL})",
+  )
+  pn.add_argument(
+    "--force",
+    action="store_true",
+    help="overwrite existing page PNGs",
   )
 
   return p
@@ -214,6 +242,49 @@ def _source_summary_dict(s) -> dict:
     "digest_count": len(s.digests),
     "latest_modified": s.latest_modified.isoformat(),
   }
+
+
+def _cmd_note(args) -> int:
+  if args.target != "ocr":
+    print(
+      f"error: unknown note target '{args.target}'. "
+      "Try `supernote note ocr <path>`.",
+      file=sys.stderr,
+    )
+    return 2
+  note_path = Path(args.path)
+  if not note_path.exists():
+    print(f"error: {note_path} does not exist", file=sys.stderr)
+    return 2
+  out_dir = Path(args.out) if args.out else Path.cwd() / note_path.stem
+  pages = api.ocr_note(note_path, out_dir, model=args.model, force=args.force)
+  if args.as_json:
+    print(
+      json.dumps(
+        [
+          {
+            "index": p.index,
+            "png_path": str(p.png_path),
+            "transcript": p.transcript,
+            "ocr_text": p.ocr_text,
+          }
+          for p in pages
+        ],
+        indent=2,
+      )
+    )
+    return 0
+  for p in pages:
+    ocr_len = len(p.ocr_text) if p.ocr_text else 0
+    transcript_len = len(p.transcript) if p.transcript else 0
+    print(
+      f"page {p.index}: {p.png_path}  "
+      f"[ocr {ocr_len} chars, transcript {transcript_len} chars]"
+    )
+    if p.ocr_text:
+      print(p.ocr_text)
+      print()
+  return 0
 
 
 def _cmd_digest(args) -> int:
@@ -346,6 +417,7 @@ _DISPATCH = {
   "sync": _cmd_sync,
   "digest": _cmd_digest,
   "source": _cmd_source,
+  "note": _cmd_note,
 }
 
 

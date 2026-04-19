@@ -1,7 +1,9 @@
 import re
 from datetime import datetime, timedelta
 
-from supernote_cli import api
+from PIL import Image
+
+from supernote_cli import api, ocr
 from supernote_cli.auth import build_channel_header, hash_password
 from supernote_cli.models import Digest, Note
 
@@ -246,3 +248,31 @@ def test_list_digested_sources_source_path_filter():
   assert len(sources) == 1
   assert sources[0].source_path == "/Document/A.pdf"
   assert [d.id for d in sources[0].digests] == ["a1"]
+
+
+def test_resize_for_ocr_no_op_when_small():
+  img = Image.new("RGB", (400, 300), "white")
+  out = ocr.resize_for_ocr(img, max_size=1024)
+  assert out.size == (400, 300)
+
+
+def test_resize_for_ocr_landscape_scales_to_max_width():
+  img = Image.new("RGB", (2048, 1024), "white")
+  out = ocr.resize_for_ocr(img, max_size=1024)
+  assert out.size == (1024, 512)
+
+
+def test_resize_for_ocr_portrait_scales_to_max_height():
+  img = Image.new("RGB", (1024, 2048), "white")
+  out = ocr.resize_for_ocr(img, max_size=1024)
+  assert out.size == (512, 1024)
+
+
+def test_image_to_base64_jpeg_returns_nonempty_str():
+  img = Image.new("RGB", (32, 32), "white")
+  s = ocr.image_to_base64_jpeg(img)
+  assert isinstance(s, str) and len(s) > 0
+  # Valid base64 decodes to JPEG SOI marker
+  import base64 as _b64
+
+  assert _b64.b64decode(s)[:3] == b"\xff\xd8\xff"

@@ -445,3 +445,82 @@ def test_37_cli_source_ls_json():
       "digest_count",
       "latest_modified",
     }
+
+
+# ---------- Local .note OCR ----------
+
+
+def _download_smallest_note(client, tmp_path):
+  entries = api.sync_folder(client, "Note", tmp_path, days_ago=30)
+  downloaded = [e for e in entries if e.action == "download"]
+  if not downloaded:
+    downloaded = [e for e in entries if e.local_path.exists()]
+  if not downloaded:
+    pytest.skip("no .note file available under Note")
+  return min(downloaded, key=lambda e: e.note.size).local_path
+
+
+def test_38_render_note(client, tmp_path):
+  note_path = _download_smallest_note(client, tmp_path / "notes")
+  out = tmp_path / "rendered"
+  pngs = api.render_note(note_path, out)
+  assert len(pngs) >= 1
+  for i, p in enumerate(pngs, start=1):
+    assert p.name == f"page_{i}.png"
+    assert p.exists()
+    assert p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_39_render_note_skip_existing(client, tmp_path):
+  note_path = _download_smallest_note(client, tmp_path / "notes")
+  out = tmp_path / "rendered"
+  first = api.render_note(note_path, out)
+  mtimes = {p: p.stat().st_mtime_ns for p in first}
+  second = api.render_note(note_path, out)
+  assert [p.name for p in second] == [p.name for p in first]
+  for p, mt in mtimes.items():
+    assert p.stat().st_mtime_ns == mt
+
+
+def test_40_extract_note_text_shape(client, tmp_path):
+  note_path = _download_smallest_note(client, tmp_path / "notes")
+  transcripts = api.extract_note_text(note_path)
+  assert isinstance(transcripts, list)
+  for t in transcripts:
+    assert isinstance(t, str)
+
+
+def _ollama_up() -> bool:
+  import requests as _rq
+
+  try:
+    _rq.get("http://localhost:11434/api/tags", timeout=1)
+    return True
+  except Exception:
+    return False
+
+
+@pytest.mark.skipif(not _ollama_up(), reason="Ollama not reachable")
+def test_41_ocr_note(client, tmp_path):
+  note_path = _download_smallest_note(client, tmp_path / "notes")
+  out = tmp_path / "ocr"
+  pages = api.ocr_note(note_path, out)
+  assert len(pages) >= 1
+  for i, page in enumerate(pages, start=1):
+    assert page.index == i
+    assert page.png_path.exists()
+    assert page.transcript is None or isinstance(page.transcript, str)
+    assert page.ocr_text is None or isinstance(page.ocr_text, str)
+
+
+def test_42_cli_note_ocr_json(client, tmp_path):
+  note_path = _download_smallest_note(client, tmp_path / "notes")
+  out = tmp_path / "cli_ocr"
+  r = _run_cli("note", "ocr", str(note_path), "--out", str(out), "--json")
+  # OCR may fail if ollama isn't running; the command still returns 0 with ocr_text=None
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  data = json.loads(r.stdout)
+  assert isinstance(data, list)
+  assert len(data) >= 1
+  for entry in data:
+    assert set(entry) == {"index", "png_path", "transcript", "ocr_text"}
