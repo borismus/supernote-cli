@@ -6,7 +6,7 @@ import datetime as dt
 import os
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .client import ApiError, Client
 from .models import Digest, DigestHash, Note
@@ -152,6 +152,78 @@ def fetch_digests_by_ids(client: Client, ids: list[str | int]) -> list[Digest]:
     include_channel=True,
   )
   return [Digest.from_api(r) for r in data.get("summaryDOList") or []]
+
+
+@dataclass
+class SourceDigests:
+  source_path: str
+  source_stem: str
+  digests: list[Digest]
+  latest_modified: dt.datetime
+
+
+def list_digested_sources(
+  client: Client,
+  *,
+  days_ago: int | None = None,
+  source_path: str | None = None,
+  batch_size: int = 100,
+) -> list[SourceDigests]:
+  """List source documents that have digests, most-recent first.
+
+  Fetches digest hashes, optionally filters by `last_modified`, chunk-fetches
+  the full digests, groups by `source_path`, and returns a list of
+  `SourceDigests` sorted by `latest_modified` descending.
+
+  Digests with empty `source_path` are dropped. Passing `source_path` returns
+  a 1- or 0-element list (filtered in-memory).
+  """
+  hashes = fetch_digest_hashes(client, size=500)
+
+  if days_ago is not None:
+    cutoff = dt.datetime.now() - dt.timedelta(days=days_ago)
+    hashes = [h for h in hashes if h.last_modified >= cutoff]
+
+  hash_by_id = {h.id: h for h in hashes}
+
+  digests: list[Digest] = []
+  ids = list(hash_by_id.keys())
+  for i in range(0, len(ids), batch_size):
+    chunk = fetch_digests_by_ids(client, ids[i : i + batch_size])
+    for d in chunk:
+      if d.last_modified_time is None:
+        h = hash_by_id.get(d.id)
+        if h is not None:
+          d.last_modified_time = h.last_modified
+      digests.append(d)
+
+  grouped: dict[str, list[Digest]] = {}
+  for d in digests:
+    if not d.source_path:
+      continue
+    if source_path is not None and d.source_path != source_path:
+      continue
+    grouped.setdefault(d.source_path, []).append(d)
+
+  out: list[SourceDigests] = []
+  for path, group in grouped.items():
+    group.sort(
+      key=lambda d: d.last_modified_time or dt.datetime.min, reverse=True
+    )
+    latest = max(
+      (d.last_modified_time for d in group if d.last_modified_time),
+      default=dt.datetime.min,
+    )
+    out.append(
+      SourceDigests(
+        source_path=path,
+        source_stem=PurePosixPath(path).stem,
+        digests=group,
+        latest_modified=latest,
+      )
+    )
+  out.sort(key=lambda s: s.latest_modified, reverse=True)
+  return out
 
 
 def fetch_handwriting_url(client: Client, digest_id: str | int) -> str | None:

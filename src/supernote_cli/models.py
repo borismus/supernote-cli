@@ -47,13 +47,24 @@ class Digest:
   id: str
   content: str
   source_path: str | None
+  has_annotation: bool
+  last_modified_time: datetime | None
   raw: dict
 
   @classmethod
-  def from_api(cls, data: dict) -> "Digest":
+  def from_api(
+    cls, data: dict, *, last_modified_time: datetime | None = None
+  ) -> "Digest":
+    mt = last_modified_time
+    if mt is None:
+      ts = data.get("lastModifiedTime")
+      if ts:
+        mt = datetime.fromtimestamp(ts / 1000)
     return cls(
       id=str(data["id"]),
       content=data.get("content") or "",
       source_path=data.get("sourcePath"),
+      has_annotation=bool(data.get("commentHandwriteName")),
+      last_modified_time=mt,
       raw=data,
     )

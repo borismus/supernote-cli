@@ -40,6 +40,26 @@ def _build_parser() -> argparse.ArgumentParser:
   sy.add_argument("--dry-run", action="store_true")
   sy.add_argument("--recursive", action="store_true")
 
+  ps = sub.add_parser(
+    "source",
+    help="list source documents that have digests (`source ls`)",
+    description=(
+      "With target 'ls': list source documents that have digests, most-recent "
+      "first, with a count of digests per source."
+    ),
+  )
+  ps.add_argument("target", help="'ls' to list sources")
+  ps.add_argument("--json", dest="as_json", action="store_true")
+  ps.add_argument(
+    "--days-ago",
+    dest="days_ago",
+    type=int,
+    help="(ls only) only include sources with digests modified within N days",
+  )
+  ps.add_argument(
+    "--limit", type=int, default=50, help="(ls only) max sources to show"
+  )
+
   pd = sub.add_parser(
     "digest",
     help="list digests (`digest ls`) or render one as PNG (`digest <id>`)",
@@ -166,6 +186,45 @@ def _cmd_sync(args) -> int:
     if k in counts:
       print(f"  {k}: {counts[k]}")
   return 0
+
+
+def _cmd_source(args) -> int:
+  if args.target == "ls":
+    return _source_list_impl(args)
+  print(
+    f"error: unknown source target '{args.target}'. "
+    "Try `supernote source ls`.",
+    file=sys.stderr,
+  )
+  return 2
+
+
+def _source_list_impl(args) -> int:
+  c = _client_from_args(args)
+  sources = api.list_digested_sources(c, days_ago=args.days_ago)
+  sources = sources[: args.limit]
+  if args.as_json:
+    print(json.dumps([_source_summary_dict(s) for s in sources], indent=2))
+    return 0
+  if not sources:
+    print("(no digested sources)")
+    return 0
+  for s in sources:
+    print(
+      f"{len(s.digests):>4}  "
+      f"{s.latest_modified.strftime('%Y-%m-%d')}  "
+      f"{s.source_path}"
+    )
+  return 0
+
+
+def _source_summary_dict(s) -> dict:
+  return {
+    "source_path": s.source_path,
+    "source_stem": s.source_stem,
+    "digest_count": len(s.digests),
+    "latest_modified": s.latest_modified.isoformat(),
+  }
 
 
 def _cmd_digest(args) -> int:
@@ -297,6 +356,7 @@ _DISPATCH = {
   "download": _cmd_download,
   "sync": _cmd_sync,
   "digest": _cmd_digest,
+  "source": _cmd_source,
 }
 
 

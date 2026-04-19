@@ -287,7 +287,14 @@ def test_23_render_handwriting_single_page(client: Client, tmp_path: Path):
 def test_24_render_handwriting_none_when_no_comment(client: Client, tmp_path: Path):
   from supernote_cli.models import Digest
 
-  fake = Digest(id="0", content="x", source_path="Document/f.pdf", raw={})
+  fake = Digest(
+    id="0",
+    content="x",
+    source_path="Document/f.pdf",
+    has_annotation=False,
+    last_modified_time=None,
+    raw={},
+  )
   assert api.render_handwriting(client, fake, tmp_path) == []
   assert list(tmp_path.iterdir()) == []
 
@@ -384,3 +391,55 @@ def test_33_cli_digest_file_path_multi_id_errors(client: Client, tmp_path: Path)
   r = _run_cli("digest", f"{d.id},{d.id}", "-o", str(target))
   assert r.returncode != 0
   assert "looks like a filename" in r.stderr or "multiple" in r.stderr.lower() or "digest IDs" in r.stderr
+
+
+# ---------- Sources ----------
+
+
+def test_34_list_digested_sources(client: Client):
+  sources = api.list_digested_sources(client, days_ago=365)
+  if not sources:
+    pytest.skip("no digested sources in the last year")
+  for s in sources[:3]:
+    assert s.source_path
+    assert s.source_stem
+    assert s.digests, "each source should carry at least one digest"
+    assert s.latest_modified.timestamp() > 0
+    for d in s.digests:
+      assert d.last_modified_time is not None, "timestamp stitched from hash"
+      assert d.source_path == s.source_path
+  # Sorted most-recent first
+  mods = [s.latest_modified for s in sources]
+  assert mods == sorted(mods, reverse=True)
+
+
+def test_35_list_digested_sources_source_path_filter(client: Client):
+  sources = api.list_digested_sources(client, days_ago=365)
+  if not sources:
+    pytest.skip("no digested sources")
+  target_path = sources[0].source_path
+  filtered = api.list_digested_sources(client, source_path=target_path)
+  assert len(filtered) == 1
+  assert filtered[0].source_path == target_path
+
+
+def test_36_cli_source_ls():
+  r = _run_cli("source", "ls", "--limit", "3")
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  # Either an empty-state message or at least one row
+  assert r.stdout.strip(), f"expected output; stderr: {r.stderr}"
+
+
+def test_37_cli_source_ls_json():
+  r = _run_cli("source", "ls", "--limit", "3", "--json")
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  data = json.loads(r.stdout)
+  assert isinstance(data, list)
+  assert len(data) <= 3
+  for entry in data:
+    assert set(entry) == {
+      "source_path",
+      "source_stem",
+      "digest_count",
+      "latest_modified",
+    }
