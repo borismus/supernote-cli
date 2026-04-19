@@ -383,3 +383,46 @@ def ocr_note(
       )
     )
   return pages
+
+
+def ocr_note_from_cloud(
+  client: Client,
+  file_id: str | int,
+  out_dir: str | os.PathLike,
+  *,
+  model: str = _ocr.DEFAULT_MODEL,
+  force: bool = False,
+) -> list[NotePage]:
+  """Download a cloud `.note` by id to a temp file, then run `ocr_note`.
+
+  PNG outputs persist under `out_dir`; the downloaded `.note` is discarded
+  after rendering.
+  """
+  with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
+    download_file(client, file_id, Path(tmp.name))
+    return ocr_note(tmp.name, out_dir, model=model, force=force)
+
+
+def list_notes(
+  client: Client,
+  folder_path: str = "Note",
+  *,
+  recursive: bool = True,
+) -> list[tuple[str, Note]]:
+  """Return `(folder_path, Note)` pairs for every `.note` file under a folder.
+
+  Recursive by default. The accompanying `folder_path` is the slash-joined
+  breadcrumb from the root to the note's containing folder (so callers can
+  reconstruct a display name).
+  """
+  _, contents = resolve_path(client, folder_path)
+  out: list[tuple[str, Note]] = []
+  for n in contents:
+    if n.is_folder:
+      if recursive:
+        child_path = f"{folder_path.rstrip('/')}/{n.file_name}"
+        out.extend(list_notes(client, child_path, recursive=True))
+      continue
+    if n.file_name.endswith(".note"):
+      out.append((folder_path, n))
+  return out

@@ -513,14 +513,56 @@ def test_41_ocr_note(client, tmp_path):
     assert page.ocr_text is None or isinstance(page.ocr_text, str)
 
 
-def test_42_cli_note_ocr_json(client, tmp_path):
-  note_path = _download_smallest_note(client, tmp_path / "notes")
-  out = tmp_path / "cli_ocr"
-  r = _run_cli("note", "ocr", str(note_path), "--out", str(out), "--json")
-  # OCR may fail if ollama isn't running; the command still returns 0 with ocr_text=None
+def _smallest_cloud_note_id(client):
+  pairs = api.list_notes(client, folder_path="Note", recursive=True)
+  if not pairs:
+    pytest.skip("no .note files under Note")
+  _, note = min(pairs, key=lambda pn: pn[1].size)
+  return note.id
+
+
+def test_42_list_notes(client):
+  pairs = api.list_notes(client, folder_path="Note", recursive=True)
+  assert len(pairs) > 0
+  for folder_path, note in pairs[:5]:
+    assert isinstance(folder_path, str)
+    assert note.file_name.endswith(".note")
+    assert not note.is_folder
+
+
+def test_43_ocr_note_from_cloud(client, tmp_path):
+  file_id = _smallest_cloud_note_id(client)
+  out = tmp_path / "cloud_ocr"
+  pages = api.ocr_note_from_cloud(client, file_id, out)
+  assert len(pages) >= 1
+  for i, p in enumerate(pages, start=1):
+    assert p.index == i
+    assert p.png_path.exists()
+    assert p.png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_44_cli_note_ls_json(client):
+  r = _run_cli("note", "ls", "--limit", "3", "--json")
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  data = json.loads(r.stdout)
+  assert isinstance(data, list)
+  assert len(data) <= 3
+  for entry in data:
+    assert set(entry) == {"id", "folder_path", "file_name", "size", "update_time"}
+    assert entry["file_name"].endswith(".note")
+
+
+def test_45_cli_note_ocr_by_id_json(client, tmp_path):
+  file_id = _smallest_cloud_note_id(client)
+  out = tmp_path / "cli_cloud_ocr"
+  r = _run_cli("note", file_id, "--out", str(out), "--json")
+  # Command should return 0 even if Ollama is unreachable (ocr_text is None then).
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert isinstance(data, list)
   assert len(data) >= 1
   for entry in data:
     assert set(entry) == {"index", "png_path", "transcript", "ocr_text"}
+  # PNG files really exist on disk
+  for entry in data:
+    assert Path(entry["png_path"]).exists()

@@ -98,30 +98,43 @@ def _build_parser() -> argparse.ArgumentParser:
 
   pn = sub.add_parser(
     "note",
-    help="operate on a local .note file (`note ocr <path>`)",
+    help="list .note files (`note ls`) or OCR one by id (`note <file-id>`)",
     description=(
-      "With target 'ocr': render each page of a local .note file to PNG "
-      "and run Ollama vision OCR on each, printing the transcript per page."
+      "With target 'ls': list all .note files under /Note/ (recursive), "
+      "most-recent first. With a numeric file id: download the note, render "
+      "each page to PNG, and run Ollama vision OCR on each."
     ),
   )
-  pn.add_argument("target", help="'ocr' to render+OCR a .note file")
-  pn.add_argument("path", help="path to a local .note file")
+  pn.add_argument(
+    "target", help="'ls' to list .note files, or a file id to OCR one"
+  )
   pn.add_argument("--json", dest="as_json", action="store_true")
+  # ls-only
+  pn.add_argument(
+    "--limit", type=int, default=50, help="(ls only) max files to show"
+  )
+  pn.add_argument(
+    "--days-ago",
+    dest="days_ago",
+    type=int,
+    help="(ls only) only include .note files modified within N days",
+  )
+  # ocr-only
   pn.add_argument(
     "-o",
     "--out",
     default=None,
-    help="output directory for page PNGs (default: ./{note_stem}/)",
+    help="(ocr only) output directory for page PNGs (default: ./{file_name}/)",
   )
   pn.add_argument(
     "--model",
     default=ocr.DEFAULT_MODEL,
-    help=f"Ollama vision model (default: {ocr.DEFAULT_MODEL})",
+    help=f"(ocr only) Ollama vision model (default: {ocr.DEFAULT_MODEL})",
   )
   pn.add_argument(
     "--force",
     action="store_true",
-    help="overwrite existing page PNGs",
+    help="(ocr only) overwrite existing page PNGs",
   )
 
   return p
@@ -245,19 +258,56 @@ def _source_summary_dict(s) -> dict:
 
 
 def _cmd_note(args) -> int:
-  if args.target != "ocr":
+  if args.target == "ls":
+    return _note_list_impl(args)
+  return _note_ocr_impl(args)
+
+
+def _note_list_impl(args) -> int:
+  import datetime as _dt
+
+  c = _client_from_args(args)
+  pairs = api.list_notes(c, folder_path="Note", recursive=True)
+  # Sort most-recent first
+  pairs.sort(key=lambda pn: pn[1].update_time, reverse=True)
+  if args.days_ago is not None:
+    cutoff = _dt.datetime.now() - _dt.timedelta(days=args.days_ago)
+    pairs = [(fp, n) for fp, n in pairs if n.update_time >= cutoff]
+  pairs = pairs[: args.limit]
+  if args.as_json:
     print(
-      f"error: unknown note target '{args.target}'. "
-      "Try `supernote note ocr <path>`.",
-      file=sys.stderr,
+      json.dumps(
+        [
+          {
+            "id": n.id,
+            "folder_path": fp,
+            "file_name": n.file_name,
+            "size": n.size,
+            "update_time": n.update_time.isoformat(),
+          }
+          for fp, n in pairs
+        ],
+        indent=2,
+      )
     )
-    return 2
-  note_path = Path(args.path)
-  if not note_path.exists():
-    print(f"error: {note_path} does not exist", file=sys.stderr)
-    return 2
-  out_dir = Path(args.out) if args.out else Path.cwd() / note_path.stem
-  pages = api.ocr_note(note_path, out_dir, model=args.model, force=args.force)
+    return 0
+  if not pairs:
+    print("(no .note files)")
+    return 0
+  for fp, n in pairs:
+    mtime = n.update_time.strftime("%Y-%m-%d %H:%M")
+    print(f"{n.size:>10}  {mtime}  {n.id:>20}  {fp}/{n.file_name}")
+  return 0
+
+
+def _note_ocr_impl(args) -> int:
+  # target is a file id (numeric-ish; Supernote ids are snowflake-like).
+  file_id = args.target
+  c = _client_from_args(args)
+  out_dir = Path(args.out) if args.out else Path.cwd() / f"note-{file_id}"
+  pages = api.ocr_note_from_cloud(
+    c, file_id, out_dir, model=args.model, force=args.force
+  )
   if args.as_json:
     print(
       json.dumps(
