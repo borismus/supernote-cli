@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,115 +29,72 @@ def _build_parser() -> argparse.ArgumentParser:
   ls.add_argument("path", nargs="?", default="", help="folder path, e.g. Note/Inbox")
   ls.add_argument("--json", dest="as_json", action="store_true")
 
-  dl = sub.add_parser("download", help="download a single file by id")
-  dl.add_argument("file_id")
-  dl.add_argument("-o", "--output", help="local path (default: file name from API)")
+  dl = sub.add_parser("download", help="download a file by path")
+  dl.add_argument("path", nargs="?", help="remote file path, e.g. Note/Inbox/foo.note")
+  dl.add_argument("--by-id", dest="by_id", help="download by file id instead of path")
+  dl.add_argument("-o", "--output", help="local path (default: remote file name)")
+
+  up = sub.add_parser("upload", help="upload a local file to a remote directory")
+  up.add_argument("local", help="local file path")
+  up.add_argument("remote_dir", help="existing remote directory, e.g. Document/Inbox")
+  up.add_argument(
+    "--overwrite",
+    action="store_true",
+    help="replace the remote file if it already exists",
+  )
+
+  rm = sub.add_parser("delete", help="delete a remote file by path")
+  rm.add_argument("paths", nargs="*", help="remote file path(s) to delete")
+  rm.add_argument("--by-id", dest="by_id", action="append", default=[], help="delete by file id (repeatable)")
 
   sy = sub.add_parser("sync", help="mirror a folder into a local directory")
   sy.add_argument("path", help="folder path to sync (e.g. Note)")
-  sy.add_argument("--out", required=True, help="local output directory")
-  sy.add_argument("--days-ago", type=int, help="only sync files modified within N days")
+  sy.add_argument("-o", "--output", required=True, help="local output directory")
+  sy.add_argument("--days-ago", dest="days_ago", type=int, help="only sync files modified within N days")
   sy.add_argument("--dry-run", action="store_true")
   sy.add_argument("--recursive", action="store_true")
 
-  ps = sub.add_parser(
+  src = sub.add_parser(
     "source",
-    help="list source documents that have digests (`source ls`)",
-    description=(
-      "With target 'ls': list source documents that have digests, most-recent "
-      "first, with a count of digests per source."
-    ),
+    help="source-document commands",
+    description="Run `source ls` to list source documents that have digests.",
   )
-  ps.add_argument("target", help="'ls' to list sources")
-  ps.add_argument("--json", dest="as_json", action="store_true")
-  ps.add_argument(
-    "--days-ago",
-    dest="days_ago",
-    type=int,
-    help="(ls only) only include sources with digests modified within N days",
-  )
-  ps.add_argument("--limit", type=int, default=50, help="(ls only) max sources to show")
+  src.add_argument("target", help="'ls' (the only subcommand today)")
+  src.add_argument("--days-ago", dest="days_ago", type=int)
+  src.add_argument("--limit", type=int, default=50)
+  src.add_argument("--json", dest="as_json", action="store_true")
 
-  pd = sub.add_parser(
+  dg = sub.add_parser(
     "digest",
-    help="list digests (`digest ls`) or render one as PNG (`digest <id>`)",
-    description=(
-      "With target 'ls': list digest summary records. "
-      "With one or more comma-separated digest IDs: print content and render "
-      "the handwritten annotation (the note drawn on top of the highlight) "
-      "to PNG named {digest_id}.png in the output directory."
-    ),
+    help="digest (highlight + annotation) commands",
+    description="Run `digest ls` to list, or `digest <id>[,id...]` to print JSON records.",
   )
-  pd.add_argument(
-    "target",
-    help="'ls' to list, or digest ID(s) (comma-separated) to render",
-  )
-  pd.add_argument("--json", dest="as_json", action="store_true")
-  # ls-only
-  pd.add_argument("--limit", type=int, default=20, help="(ls only) max records to show")
-  # render-only
-  pd.add_argument(
-    "-o",
-    "--out",
-    default=".",
-    help=(
-      "(render only) output path. If it ends with .png, it is the target "
-      "filename (only valid with a single ID). Otherwise it is treated as "
-      "a directory and PNGs are named {digest_id}.png. Default: CWD."
-    ),
-  )
-  pd.add_argument(
-    "--no-annotation",
-    dest="no_annotation",
-    action="store_true",
-    help="(render only) print digest content only; skip the PNG render",
-  )
-  pd.add_argument(
-    "--force",
-    action="store_true",
-    help="(render only) overwrite existing PNG files",
-  )
+  dg.add_argument("target", help="'ls' to list, or digest id(s) comma-separated")
+  # ls
+  dg.add_argument("--limit", type=int, default=20, help="max records to list")
+  dg.add_argument("--days-ago", dest="days_ago", type=int, help="only include digests modified within N days")
+  dg.add_argument("--json", dest="as_json", action="store_true", help="JSON output (ls only; id form is always JSON)")
+  # <id>
+  dg.add_argument("-o", "--output", default=".", help="output directory; PNGs go under {output}/attachments/")
+  dg.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="skip Ollama OCR of the handwritten annotation")
+  dg.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  dg.add_argument("--force", action="store_true", help="overwrite existing handwritten_image PNGs")
 
-  pn = sub.add_parser(
+  nt = sub.add_parser(
     "note",
-    help="list .note files (`note ls`) or OCR one by id (`note <file-id>`)",
-    description=(
-      "With target 'ls': list all .note files under /Note/ (recursive), "
-      "most-recent first. With a numeric file id: download the note, render "
-      "each page to PNG, and run Ollama vision OCR on each."
-    ),
+    help=".note file commands",
+    description="Run `note ls` to list, or `note <id>` to print a JSON per-page array.",
   )
-  pn.add_argument(
-    "target", help="'ls' to list .note files, or a file id to OCR one"
-  )
-  pn.add_argument("--json", dest="as_json", action="store_true")
-  # ls-only
-  pn.add_argument(
-    "--limit", type=int, default=50, help="(ls only) max files to show"
-  )
-  pn.add_argument(
-    "--days-ago",
-    dest="days_ago",
-    type=int,
-    help="(ls only) only include .note files modified within N days",
-  )
-  # ocr-only
-  pn.add_argument(
-    "-o",
-    "--out",
-    default=None,
-    help="(ocr only) output directory for page PNGs (default: ./{file_name}/)",
-  )
-  pn.add_argument(
-    "--model",
-    default=ocr.DEFAULT_MODEL,
-    help=f"(ocr only) Ollama vision model (default: {ocr.DEFAULT_MODEL})",
-  )
-  pn.add_argument(
-    "--force",
-    action="store_true",
-    help="(ocr only) overwrite existing page PNGs",
-  )
+  nt.add_argument("target", help="'ls' to list .note files, or a cloud file id to fetch one")
+  # ls
+  nt.add_argument("--limit", type=int, default=50, help="max records to list")
+  nt.add_argument("--days-ago", dest="days_ago", type=int, help="only include files modified within N days")
+  nt.add_argument("--json", dest="as_json", action="store_true", help="JSON output (ls only; id form is always JSON)")
+  # <id>
+  nt.add_argument("-o", "--output", help="output directory (default: ./note-{id}/); PNGs go under {output}/attachments/")
+  nt.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="skip Ollama OCR on each page")
+  nt.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  nt.add_argument("--force", action="store_true", help="overwrite existing page PNGs")
 
   return p
 
@@ -149,7 +108,7 @@ def _client_from_args(args) -> Client:
 
 def _cmd_login(args) -> int:
   c = _client_from_args(args)
-  c.token = None  # force fresh login even if cache exists
+  c.token = None
   c.login()
   print(f"logged in as {c.account}, token cached at {tokenstore.token_path()}")
   return 0
@@ -190,25 +149,84 @@ def _cmd_ls(args) -> int:
 
 
 def _cmd_download(args) -> int:
+  if not args.path and not args.by_id:
+    print("error: provide a remote path or --by-id ID", file=sys.stderr)
+    return 2
+  if args.path and args.by_id:
+    print("error: pass either a path or --by-id, not both", file=sys.stderr)
+    return 2
+
   c = _client_from_args(args)
-  out = args.output
-  if out is None:
-    out = f"supernote-{args.file_id}.note"
-  dest = Path(out)
-  n = c.download_to(api.download_url(c, args.file_id), dest)
+  if args.path:
+    note = api.resolve_file(c, args.path)
+    file_id = note.id
+    default_name = note.file_name
+  else:
+    file_id = args.by_id
+    default_name = f"supernote-{file_id}.note"
+
+  dest = Path(args.output or default_name)
+  n = c.download_to(api.download_url(c, file_id), dest)
   print(f"wrote {n} bytes to {dest}")
   return 0
+
+
+def _cmd_upload(args) -> int:
+  c = _client_from_args(args)
+  note = api.upload_file(c, args.local, args.remote_dir, overwrite=args.overwrite)
+  print(f"uploaded: {args.remote_dir.rstrip('/')}/{note.file_name}  (id={note.id}, {note.size} bytes)")
+  return 0
+
+
+def _cmd_delete(args) -> int:
+  if not args.paths and not args.by_id:
+    print("error: provide at least one path or --by-id ID", file=sys.stderr)
+    return 2
+  c = _client_from_args(args)
+  rc = 0
+  for path in args.paths:
+    try:
+      note = api.resolve_file(c, path)
+      api.delete_file(c, note)
+      print(f"deleted: {path}  (id={note.id})")
+    except ApiError as e:
+      print(f"error: {path}: {e}", file=sys.stderr)
+      rc = 1
+  for fid in args.by_id:
+    # delete endpoint requires directoryId; walk the tree to find the file's parent.
+    note = _find_note_by_id(c, fid)
+    if note is None:
+      print(f"error: id {fid}: not found", file=sys.stderr)
+      rc = 1
+      continue
+    try:
+      api.delete_file(c, note)
+      print(f"deleted: id={fid}")
+    except ApiError as e:
+      print(f"error: id {fid}: {e}", file=sys.stderr)
+      rc = 1
+  return rc
+
+
+def _find_note_by_id(client, file_id: str):
+  """Walk the folder tree looking for a file with the given id. Escape hatch."""
+  def _walk(directory_id):
+    for n in api.list_files(client, directory_id):
+      if str(n.id) == str(file_id) and not n.is_folder:
+        return n
+      if n.is_folder:
+        found = _walk(n.id)
+        if found is not None:
+          return found
+    return None
+  return _walk(0)
 
 
 def _cmd_sync(args) -> int:
   c = _client_from_args(args)
   entries = api.sync_folder(
-    c,
-    args.path,
-    args.out,
-    days_ago=args.days_ago,
-    dry_run=args.dry_run,
-    recursive=args.recursive,
+    c, args.path, args.output,
+    days_ago=args.days_ago, dry_run=args.dry_run, recursive=args.recursive,
   )
   counts: dict[str, int] = {}
   for e in entries:
@@ -224,16 +242,9 @@ def _cmd_sync(args) -> int:
 
 
 def _cmd_source(args) -> int:
-  if args.target == "ls":
-    return _source_list_impl(args)
-  print(
-    f"error: unknown source target '{args.target}'. Try `supernote source ls`.",
-    file=sys.stderr,
-  )
-  return 2
-
-
-def _source_list_impl(args) -> int:
+  if args.target != "ls":
+    print(f"error: unknown source target '{args.target}'. Try `supernote source ls`.", file=sys.stderr)
+    return 2
   c = _client_from_args(args)
   sources = api.list_digested_sources(c, days_ago=args.days_ago)
   sources = sources[: args.limit]
@@ -248,104 +259,18 @@ def _source_list_impl(args) -> int:
   return 0
 
 
-def _source_summary_dict(s) -> dict:
-  return {
-    "source_path": s.source_path,
-    "source_stem": s.source_stem,
-    "digest_count": len(s.digests),
-    "latest_modified": s.latest_modified.isoformat(),
-  }
-
-
-def _cmd_note(args) -> int:
-  if args.target == "ls":
-    return _note_list_impl(args)
-  return _note_ocr_impl(args)
-
-
-def _note_list_impl(args) -> int:
-  import datetime as _dt
-
-  c = _client_from_args(args)
-  pairs = api.list_notes(c, folder_path="Note", recursive=True)
-  # Sort most-recent first
-  pairs.sort(key=lambda pn: pn[1].update_time, reverse=True)
-  if args.days_ago is not None:
-    cutoff = _dt.datetime.now() - _dt.timedelta(days=args.days_ago)
-    pairs = [(fp, n) for fp, n in pairs if n.update_time >= cutoff]
-  pairs = pairs[: args.limit]
-  if args.as_json:
-    print(
-      json.dumps(
-        [
-          {
-            "id": n.id,
-            "folder_path": fp,
-            "file_name": n.file_name,
-            "size": n.size,
-            "update_time": n.update_time.isoformat(),
-          }
-          for fp, n in pairs
-        ],
-        indent=2,
-      )
-    )
-    return 0
-  if not pairs:
-    print("(no .note files)")
-    return 0
-  for fp, n in pairs:
-    mtime = n.update_time.strftime("%Y-%m-%d %H:%M")
-    print(f"{n.size:>10}  {mtime}  {n.id:>20}  {fp}/{n.file_name}")
-  return 0
-
-
-def _note_ocr_impl(args) -> int:
-  # target is a file id (numeric-ish; Supernote ids are snowflake-like).
-  file_id = args.target
-  c = _client_from_args(args)
-  out_dir = Path(args.out) if args.out else Path.cwd() / f"note-{file_id}"
-  pages = api.ocr_note_from_cloud(
-    c, file_id, out_dir, model=args.model, force=args.force
-  )
-  if args.as_json:
-    print(
-      json.dumps(
-        [
-          {
-            "index": p.index,
-            "png_path": str(p.png_path),
-            "transcript": p.transcript,
-            "ocr_text": p.ocr_text,
-          }
-          for p in pages
-        ],
-        indent=2,
-      )
-    )
-    return 0
-  for p in pages:
-    ocr_len = len(p.ocr_text) if p.ocr_text else 0
-    transcript_len = len(p.transcript) if p.transcript else 0
-    print(
-      f"page {p.index}: {p.png_path}  "
-      f"[ocr {ocr_len} chars, transcript {transcript_len} chars]"
-    )
-    if p.ocr_text:
-      print(p.ocr_text)
-      print()
-  return 0
-
-
 def _cmd_digest(args) -> int:
   if args.target == "ls":
-    return _digest_list_impl(args)
-  return _digest_render_impl(args)
+    return _digest_ls(args)
+  return _digest_show(args)
 
 
-def _digest_list_impl(args) -> int:
+def _digest_ls(args) -> int:
   c = _client_from_args(args)
   hashes = api.fetch_digest_hashes(c, size=max(args.limit, 500))
+  if args.days_ago is not None:
+    cutoff = dt.datetime.now() - dt.timedelta(days=args.days_ago)
+    hashes = [h for h in hashes if h.last_modified >= cutoff]
   hashes = hashes[: args.limit]
   if args.as_json:
     print(json.dumps([_digest_hash_dict(h) for h in hashes], indent=2))
@@ -366,75 +291,175 @@ def _digest_list_impl(args) -> int:
   return 0
 
 
-def _digest_render_impl(args) -> int:
+def _digest_show(args) -> int:
   c = _client_from_args(args)
   ids = [i.strip() for i in args.target.split(",") if i.strip()]
+  out_dir = Path(args.output)
+  attachments_dir = out_dir / "attachments"
 
-  out_path = Path(args.out)
-  as_file = out_path.suffix.lower() == ".png"
-  if as_file and len(ids) > 1:
-    print(
-      f"error: -o {args.out} looks like a filename but you passed "
-      f"{len(ids)} digest IDs; use a directory path or a single ID",
-      file=sys.stderr,
-    )
-    return 2
+  runner = _OcrRunner(enabled=not args.no_ocr, model=args.model)
+  if runner.enabled:
+    try:
+      ocr.check_available()
+    except ocr.OcrError as e:
+      print(f"error: {e}", file=sys.stderr)
+      return 2
 
   digests = api.fetch_digests_by_ids(c, ids)
-
-  if args.as_json:
-    print(json.dumps([_digest_dict(d) for d in digests], indent=2))
-  else:
-    for d in digests:
-      print(f"=== {d.id}  {d.source_path or ''}")
-      print(d.content or "(empty)")
-      print()
-
-  if args.no_annotation:
-    return 0
-
-  for d in digests:
-    written = api.render_handwriting(c, d, out_path, force=args.force)
-    if written:
-      for p in written:
-        print(f"rendered: {p}", file=sys.stderr)
+  by_id = {d.id: d for d in digests}
+  records = []
+  for did in ids:
+    d = by_id.get(did)
+    if d is None:
+      print(f"warning: digest {did} not found", file=sys.stderr)
       continue
-    # Empty list: either already-existed-and-not-forced, or no annotation
-    if d.raw.get("commentHandwriteName"):
-      existing = _existing_render_paths(out_path, d.id, as_file)
-      for p in existing:
-        print(f"already exists: {p}", file=sys.stderr)
-      if not existing:
-        # Rare: had annotation but render returned nothing and no files exist
-        print(f"no annotation for {d.id}", file=sys.stderr)
-    else:
-      print(f"no annotation for {d.id}", file=sys.stderr)
+    records.append(_digest_record(c, d, attachments_dir, out_dir, runner, force=args.force))
+
+  print(json.dumps(records[0] if len(records) == 1 else records, indent=2))
   return 0
 
 
-def _existing_render_paths(out_path: Path, digest_id: str, as_file: bool) -> list[Path]:
-  """Enumerate already-on-disk PNG outputs for a digest at this out_path."""
-  if as_file:
-    if out_path.exists():
-      return [out_path]
-    # multi-page sibling pattern
-    stem, suffix = out_path.stem, out_path.suffix
-    found = []
-    n = 0
-    while (sib := out_path.with_name(f"{stem}_p{n + 1}{suffix}")).exists():
-      found.append(sib)
-      n += 1
-    return found
-  # directory mode
-  single = out_path / f"{digest_id}.png"
+def _digest_record(c, digest, attachments_dir, out_dir, runner, *, force: bool) -> dict:
+  rec: dict = {
+    "id": digest.id,
+    "digest": digest.content or "",
+    "annotation": None,
+    "handwritten_image": None,
+    "source_path": digest.source_path,
+    "last_modified": digest.last_modified_time.isoformat() if digest.last_modified_time else None,
+  }
+  if not digest.has_annotation:
+    return rec
+  png_paths = api.render_handwriting(c, digest, attachments_dir, force=force)
+  if not png_paths:
+    png_paths = _existing_handwriting_paths(attachments_dir, digest.id)
+  rel_paths = [str(p.relative_to(out_dir)) if _is_relative_to(p, out_dir) else str(p) for p in png_paths]
+  if rel_paths:
+    rec["handwritten_image"] = rel_paths[0] if len(rel_paths) == 1 else rel_paths
+  if runner.enabled and png_paths:
+    ocr_texts = [runner.run(p) for p in png_paths]
+    joined = "\n".join(t for t in ocr_texts if t)
+    rec["annotation"] = joined or None
+  return rec
+
+
+def _existing_handwriting_paths(attachments_dir: Path, digest_id: str) -> list[Path]:
+  single = attachments_dir / f"{digest_id}.png"
   if single.exists():
     return [single]
   found = []
   n = 0
-  while (p := out_path / f"{digest_id}_p{n + 1}.png").exists():
+  while (p := attachments_dir / f"{digest_id}_p{n + 1}.png").exists():
     found.append(p)
     n += 1
   return found
+
+
+def _is_relative_to(p: Path, base: Path) -> bool:
+  try:
+    p.relative_to(base)
+    return True
+  except ValueError:
+    return False
+
+
+def _cmd_note(args) -> int:
+  if args.target == "ls":
+    return _note_ls(args)
+  return _note_show(args)
+
+
+def _note_ls(args) -> int:
+  c = _client_from_args(args)
+  pairs = api.list_notes(c, folder_path="Note", recursive=True)
+  pairs.sort(key=lambda pn: pn[1].update_time, reverse=True)
+  if args.days_ago is not None:
+    cutoff = dt.datetime.now() - dt.timedelta(days=args.days_ago)
+    pairs = [(fp, n) for fp, n in pairs if n.update_time >= cutoff]
+  pairs = pairs[: args.limit]
+  if args.as_json:
+    print(json.dumps(
+      [
+        {"id": n.id, "folder_path": fp, "file_name": n.file_name, "size": n.size, "update_time": n.update_time.isoformat()}
+        for fp, n in pairs
+      ],
+      indent=2,
+    ))
+    return 0
+  if not pairs:
+    print("(no .note files)")
+    return 0
+  for fp, n in pairs:
+    mtime = n.update_time.strftime("%Y-%m-%d %H:%M")
+    print(f"{n.size:>10}  {mtime}  {n.id:>20}  {fp}/{n.file_name}")
+  return 0
+
+
+def _note_show(args) -> int:
+  c = _client_from_args(args)
+  file_id = args.target
+  out_dir = Path(args.output) if args.output else Path.cwd() / f"note-{file_id}"
+  attachments_dir = out_dir / "attachments"
+  attachments_dir.mkdir(parents=True, exist_ok=True)
+
+  runner = _OcrRunner(enabled=not args.no_ocr, model=args.model)
+  if runner.enabled:
+    try:
+      ocr.check_available()
+    except ocr.OcrError as e:
+      print(f"error: {e}", file=sys.stderr)
+      return 2
+
+  with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
+    api.download_file(c, file_id, Path(tmp.name))
+    png_paths = api.render_note(tmp.name, attachments_dir, force=args.force)
+    transcripts = api.extract_note_text(tmp.name)
+
+  # Rename page PNGs to the `{file_id}-p{N}.png` scheme for stable references.
+  renamed: list[Path] = []
+  for i, p in enumerate(png_paths):
+    dest = attachments_dir / f"{file_id}-p{i + 1}.png"
+    if p != dest:
+      if dest.exists() and not args.force:
+        p.unlink(missing_ok=True)
+      else:
+        p.replace(dest)
+    renamed.append(dest)
+
+  records = []
+  for i, png in enumerate(renamed):
+    rel = str(png.relative_to(out_dir)) if _is_relative_to(png, out_dir) else str(png)
+    records.append({
+      "page": i + 1,
+      "transcript": (transcripts[i] if i < len(transcripts) else "") or None,
+      "annotation": runner.run(png) if runner.enabled and png.exists() else None,
+      "handwritten_image": rel,
+    })
+  print(json.dumps(records, indent=2))
+  return 0
+
+
+class _OcrRunner:
+  """Runs `ocr_image` per path, giving up after the first error per invocation.
+
+  On first error, prints the error to stderr and returns None for all
+  subsequent calls. Callers should still respect `enabled` to skip entirely.
+  """
+
+  def __init__(self, *, enabled: bool, model: str):
+    self.enabled = enabled
+    self.model = model
+    self._errored = False
+
+  def run(self, path: Path) -> str | None:
+    if not self.enabled or self._errored:
+      return None
+    try:
+      return ocr.ocr_image(path, model=self.model)
+    except ocr.OcrError as e:
+      print(f"ollama error: {e}", file=sys.stderr)
+      self._errored = True
+      return None
 
 
 def _note_dict(n) -> dict:
@@ -454,8 +479,13 @@ def _digest_hash_dict(h) -> dict:
   return {"id": h.id, "md5Hash": h.md5_hash, "lastModified": h.last_modified.isoformat()}
 
 
-def _digest_dict(d) -> dict:
-  return {"id": d.id, "sourcePath": d.source_path, "content": d.content}
+def _source_summary_dict(s) -> dict:
+  return {
+    "source_path": s.source_path,
+    "source_stem": s.source_stem,
+    "digest_count": len(s.digests),
+    "latest_modified": s.latest_modified.isoformat(),
+  }
 
 
 _DISPATCH = {
@@ -464,6 +494,8 @@ _DISPATCH = {
   "whoami": _cmd_whoami,
   "ls": _cmd_ls,
   "download": _cmd_download,
+  "upload": _cmd_upload,
+  "delete": _cmd_delete,
   "sync": _cmd_sync,
   "digest": _cmd_digest,
   "source": _cmd_source,

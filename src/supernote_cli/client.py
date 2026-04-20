@@ -92,14 +92,18 @@ class Client:
     payload: dict,
     *,
     include_channel: bool = False,
+    extra_headers: dict | None = None,
     _retry: bool = True,
   ) -> dict:
     if not self.token:
       self.login()
+    headers = self._headers(include_channel=include_channel)
+    if extra_headers:
+      headers.update(extra_headers)
     r = requests.post(
       API_BASE + path,
       json=payload,
-      headers=self._headers(include_channel=include_channel),
+      headers=headers,
       timeout=30,
     )
     if self.verbose:
@@ -108,7 +112,10 @@ class Client:
     if r.status_code == 401 and _retry and self._password:
       self.token = None
       self.login()
-      return self._post(path, payload, include_channel=include_channel, _retry=False)
+      return self._post(
+        path, payload, include_channel=include_channel,
+        extra_headers=extra_headers, _retry=False,
+      )
 
     try:
       data = r.json()
@@ -122,7 +129,10 @@ class Client:
     if data.get("errorCode") == "E0401" and _retry and self._password:
       self.token = None
       self.login()
-      return self._post(path, payload, include_channel=include_channel, _retry=False)
+      return self._post(
+        path, payload, include_channel=include_channel,
+        extra_headers=extra_headers, _retry=False,
+      )
 
     if data.get("success") is False:
       raise ApiError(
@@ -148,3 +158,17 @@ class Client:
             f.write(chunk)
             total += len(chunk)
     return total
+
+  def put_binary(self, url: str, path: Path, headers: dict) -> int:
+    """Stream `path` to `url` with a PUT, attaching `headers`.
+
+    Used to upload to the signed S3 URL returned by `file/upload/apply`.
+    Returns the number of bytes sent.
+    """
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+      r = requests.put(url, data=f, headers=headers, timeout=600)
+    if self.verbose:
+      print(f"PUT {url} -> HTTP {r.status_code} ({size} bytes)")
+    r.raise_for_status()
+    return size

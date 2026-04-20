@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import os
+import random
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -56,6 +59,170 @@ def download_url(client: Client, file_id: str | int) -> str:
 def download_file(client: Client, file_id: str | int, dest: Path) -> int:
   url = download_url(client, file_id)
   return client.download_to(url, dest)
+
+
+def delete_file(client: Client, note: Note) -> None:
+  """Delete a remote file. Requires a `Note` (not just an id) because the
+  endpoint wants `directoryId` alongside the file id list."""
+  client._post(
+    "file/delete",
+    {
+      "idList": [str(note.id)],
+      "directoryId": str(note.directory_id) if note.directory_id else "0",
+    },
+  )
+
+
+def resolve_file(client: Client, path: str) -> Note:
+  """Resolve a slash-separated remote path to the `Note` for its leaf file.
+
+  The last path component must be a file (not a folder); raises `ApiError`
+  otherwise.
+  """
+  parts = [p for p in (path or "").split("/") if p]
+  if not parts:
+    raise ApiError("empty path; expected a file path like 'Note/Inbox/foo.note'")
+  parent_path = "/".join(parts[:-1])
+  leaf = parts[-1]
+  _, contents = resolve_path(client, parent_path)
+  match = next((n for n in contents if not n.is_folder and n.file_name == leaf), None)
+  if match is None:
+    where = parent_path or "(root)"
+    raise ApiError(f"file '{leaf}' not found in {where}")
+  return match
+
+
+def _md5_file(path: Path) -> str:
+  h = hashlib.md5()
+  with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(1 << 20), b""):
+      h.update(chunk)
+  return h.hexdigest()
+
+
+def _upload_apply_headers() -> dict:
+  ts = int(time.time() * 1000)
+  nonce = f"{random.randint(10**9, 10**10 - 1)}{ts}"
+  return {"nonce": nonce, "timestamp": str(ts)}
+
+
+def upload_file(
+  client: Client,
+  local_path: str | os.PathLike,
+  remote_dir: str,
+  *,
+  overwrite: bool = False,
+) -> Note:
+  """Upload a local file to a remote directory.
+
+  Flow: `file/upload/apply` -> signed PUT to S3 -> `file/upload/finish`.
+  `remote_dir` must resolve to an existing folder; no auto-create.
+
+  If a file with the same name already exists in `remote_dir`:
+    - `overwrite=False` raises `ApiError("already exists: ...")`
+    - `overwrite=True` deletes the existing file first via `file/delete`.
+
+  Returns the `Note` for the newly uploaded file.
+  """
+  src = Path(local_path)
+  if not src.is_file():
+    raise ApiError(f"local file not found: {src}")
+
+  directory_id, contents = resolve_path(client, remote_dir)
+  existing = next(
+    (n for n in contents if not n.is_folder and n.file_name == src.name), None
+  )
+  if existing is not None:
+    if not overwrite:
+      raise ApiError(f"already exists: {remote_dir.rstrip('/')}/{src.name}")
+    delete_file(client, existing)
+    # Delete is async on the server side; wait for the listing to reflect
+    # the absence before we start a new apply/PUT/finish cycle, otherwise
+    # finish fails with "Server Error" on the not-yet-propagated filename.
+    for _ in range(20):
+      _, check = resolve_path(client, remote_dir)
+      if not any(n.file_name == src.name and not n.is_folder for n in check):
+        break
+      time.sleep(0.25)
+    else:
+      raise ApiError(
+        f"timed out waiting for deletion of {remote_dir.rstrip('/')}/{src.name} to propagate"
+      )
+
+  size = src.stat().st_size
+  md5 = _md5_file(src)
+  apply_payload = {
+    "size": size,
+    "fileName": src.name,
+    "directoryId": str(directory_id) if directory_id else "0",
+    "md5": md5,
+  }
+  apply_resp = client._post(
+    "file/upload/apply", apply_payload, extra_headers=_upload_apply_headers()
+  )
+
+  signed_url = apply_resp.get("url") or apply_resp.get("signedUrl")
+  if not signed_url:
+    raise ApiError(f"upload/apply: no signed url in response: {apply_resp}")
+
+  inner_name = apply_resp.get("innerName") or apply_resp.get("fileKey")
+  if not inner_name:
+    # Server often returns innerName as null and embeds it in the URL path.
+    inner_name = signed_url.rsplit("/", 1)[-1].split("?", 1)[0]
+
+  put_headers = _extract_s3_headers(apply_resp)
+  client.put_binary(signed_url, src, put_headers)
+
+  finish_payload = {
+    "directoryId": str(directory_id) if directory_id else "0",
+    "fileName": src.name,
+    "fileSize": size,
+    "innerName": inner_name,
+    "md5": md5,
+  }
+  finish_resp = client._post("file/upload/finish", finish_payload)
+  note_data = (
+    finish_resp.get("userFileVO")
+    or finish_resp.get("data")
+    or finish_resp.get("file")
+  )
+  if note_data:
+    return Note.from_api(note_data)
+
+  # Fallback: re-list the directory and find our file.
+  _, contents = resolve_path(client, remote_dir)
+  match = next(
+    (n for n in contents if not n.is_folder and n.file_name == src.name), None
+  )
+  if match is None:
+    raise ApiError(
+      f"upload finished but '{src.name}' not found in {remote_dir}; "
+      f"response: {finish_resp}"
+    )
+  return match
+
+
+def _extract_s3_headers(apply_resp: dict) -> dict:
+  """Pull the S3 PUT headers out of an upload/apply response."""
+  auth = (
+    apply_resp.get("s3Authorization")
+    or apply_resp.get("authorization")
+    or apply_resp.get("Authorization")
+  )
+  amz_date = (
+    apply_resp.get("xamzDate")
+    or apply_resp.get("xAmzDate")
+    or apply_resp.get("amzDate")
+    or apply_resp.get("x-amz-date")
+  )
+  if not auth or not amz_date:
+    raise ApiError(f"upload/apply: missing signing headers in response: {apply_resp}")
+  return {
+    "Authorization": auth,
+    "x-amz-date": amz_date,
+    "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+    "Content-Type": "application/x-www-form-urlencoded",
+  }
 
 
 @dataclass
@@ -373,7 +540,12 @@ def ocr_note(
   pages: list[NotePage] = []
   for i, png in enumerate(png_paths):
     transcript = transcripts[i] if i < len(transcripts) else ""
-    ocr_text = _ocr.ocr_image(png, model=model) if png.exists() else None
+    ocr_text: str | None = None
+    if png.exists():
+      try:
+        ocr_text = _ocr.ocr_image(png, model=model)
+      except _ocr.OcrError:
+        ocr_text = None
     pages.append(
       NotePage(
         index=i + 1,

@@ -1,8 +1,8 @@
 """Local Ollama vision OCR for Supernote handwriting.
 
 Calls a locally-running Ollama daemon (default http://localhost:11434)
-with a handwriting-tuned prompt. Returns the transcription string, or
-None on any transport/parse error (so callers can fall back cleanly).
+with a handwriting-tuned prompt. `ocr_image` raises `OcrError` on failure
+so callers can decide how to surface or downgrade.
 
 Runtime dep: Ollama with a vision model pulled (default qwen3-vl:8b).
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 import io
-import traceback
+import os
 from pathlib import Path
 
 import requests
@@ -35,8 +35,25 @@ Critical constraints:
 
 DEFAULT_MODEL = "qwen3-vl:8b"
 DEFAULT_MAX_SIZE = 1024
-DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_TIMEOUT = 300
+
+
+def default_host() -> str:
+  return os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+
+class OcrError(Exception):
+  """Raised when Ollama is unreachable or returns an error."""
+
+
+def check_available(*, host: str | None = None, timeout: int = 5) -> None:
+  """Ping Ollama at `host/api/tags`. Raises `OcrError` on any failure."""
+  h = host or default_host()
+  try:
+    r = requests.get(f"{h}/api/tags", timeout=timeout)
+    r.raise_for_status()
+  except requests.RequestException as e:
+    raise OcrError(f"Ollama not reachable at {h}. Start Ollama or pass --no-ocr.") from e
 
 
 def resize_for_ocr(image: Image.Image, max_size: int = DEFAULT_MAX_SIZE) -> Image.Image:
@@ -62,13 +79,18 @@ def ocr_base64(
   image_base64: str,
   *,
   model: str = DEFAULT_MODEL,
-  host: str = DEFAULT_HOST,
+  host: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
-) -> str | None:
-  """POST an already-base64-JPEG image to Ollama's chat endpoint."""
+) -> str:
+  """POST an already-base64-JPEG image to Ollama's chat endpoint.
+
+  Returns the transcription string. Raises `OcrError` on transport error,
+  HTTP error, or unexpected response shape.
+  """
+  h = host or default_host()
   try:
     response = requests.post(
-      f"{host}/api/chat",
+      f"{h}/api/chat",
       json={
         "model": model,
         "messages": [
@@ -82,36 +104,27 @@ def ocr_base64(
       },
       timeout=timeout,
     )
+  except requests.RequestException as e:
+    raise OcrError(f"Ollama request failed: {type(e).__name__}: {e}") from e
 
-    if response.status_code != 200:
-      error_detail = response.text
-      try:
-        error_detail = response.json().get("error", error_detail)
-      except Exception:
-        pass
-      print(f"Error from ollama API (status {response.status_code}): {error_detail}")
-      return None
+  if response.status_code != 200:
+    detail = response.text
+    try:
+      detail = response.json().get("error", detail)
+    except ValueError:
+      pass
+    raise OcrError(f"Ollama returned HTTP {response.status_code}: {detail}")
 
+  try:
     data = response.json()
-    if "message" in data and "content" in data["message"]:
-      return data["message"]["content"].strip()
-    if "response" in data:
-      return data["response"].strip()
-    print(f"Warning: Unexpected response format from ollama API: {data}")
-    return None
-  except requests.exceptions.Timeout as e:
-    print(f"Error: OCR request timed out after {timeout} seconds: {e}")
-    return None
-  except requests.exceptions.ConnectionError as e:
-    print(f"Error: Could not connect to ollama API at {host}: {e}")
-    return None
-  except requests.exceptions.RequestException as e:
-    print(f"Error calling ollama API: {type(e).__name__}: {e}")
-    return None
-  except Exception as e:
-    print(f"Unexpected error during OCR: {type(e).__name__}: {e}")
-    traceback.print_exc()
-    return None
+  except ValueError as e:
+    raise OcrError(f"Ollama returned non-JSON: {response.text[:200]}") from e
+
+  if "message" in data and "content" in data["message"]:
+    return data["message"]["content"].strip()
+  if "response" in data:
+    return data["response"].strip()
+  raise OcrError(f"Unexpected Ollama response shape: {data}")
 
 
 def ocr_image(
@@ -119,13 +132,12 @@ def ocr_image(
   *,
   model: str = DEFAULT_MODEL,
   max_size: int = DEFAULT_MAX_SIZE,
-  host: str = DEFAULT_HOST,
+  host: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
-) -> str | None:
+) -> str:
   """Run OCR on an image path or PIL Image via local Ollama vision.
 
-  Returns the transcription string, or None if OCR failed for any reason
-  (network, model error, unexpected response). Never raises.
+  Raises `OcrError` on any failure.
   """
   if isinstance(image, (str, Path)):
     img = Image.open(image)

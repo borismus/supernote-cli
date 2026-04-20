@@ -2,6 +2,7 @@ from . import api, auth, ocr, tokenstore
 from .api import (
   NotePage,
   SourceDigests,
+  delete_file,
   extract_note_text,
   list_digested_sources,
   list_notes,
@@ -9,16 +10,19 @@ from .api import (
   ocr_note_from_cloud,
   render_handwriting,
   render_note,
+  resolve_file,
+  upload_file,
 )
 from .auth import login
 from .client import ApiError, AuthRequired, Client
 from .models import Digest, DigestHash, Note
-from .ocr import ocr_image
+from .ocr import OcrError, ocr_image
 
 __all__ = [
   "Client",
   "ApiError",
   "AuthRequired",
+  "OcrError",
   "Note",
   "Digest",
   "DigestHash",
@@ -33,6 +37,9 @@ __all__ = [
   "ocr_image",
   "list_digested_sources",
   "list_notes",
+  "delete_file",
+  "resolve_file",
+  "upload_file",
   "api",
   "auth",
   "ocr",
