@@ -236,7 +236,7 @@ def test_20_cli_digest_ls():
 
 
 def test_21_cli_sync_dry_run(tmp_path):
-  r = _run_cli("sync", "Note", "--out", str(tmp_path), "--dry-run", "--days-ago", "30")
+  r = _run_cli("sync", "Note", "-o", str(tmp_path), "--dry-run", "--days-ago", "30")
   assert r.returncode == 0, f"stderr: {r.stderr}"
 
 
@@ -322,77 +322,77 @@ def test_26_render_handwriting_force_rewrites(client: Client, tmp_path: Path):
     assert p.stat().st_mtime_ns >= mt, f"{p} should have been re-written"
 
 
-def test_27_cli_digest_render(client: Client, tmp_path: Path):
+def test_27_cli_digest_json_shape(client: Client, tmp_path: Path):
+  """`digest <id>` with annotation prints JSON object using Supernote terms."""
   d = _first_digest_with_annotation(client)
-  r = _run_cli("digest", d.id, "-o", str(tmp_path))
+  r = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
   assert r.returncode == 0, f"stderr: {r.stderr}"
-  assert d.id in r.stdout
-  # Expect a {id}.png or {id}_p1.png in the out dir
-  pngs = list(tmp_path.glob(f"{d.id}*.png"))
-  assert pngs, f"no PNG; stderr: {r.stderr}"
-  assert "rendered:" in r.stderr
+  data = json.loads(r.stdout)
+  assert data["id"] == d.id
+  assert "digest" in data  # highlight content
+  assert data["annotation"] is None, "--no-ocr must null out annotation"
+  assert data["handwritten_image"], "expected handwritten_image path in JSON"
+  assert "source_path" in data
+  assert "last_modified" in data
+  # PNG really on disk under {-o}/attachments/
+  img = data["handwritten_image"]
+  paths = [img] if isinstance(img, str) else img
+  for rel in paths:
+    assert (tmp_path / rel).exists(), f"missing: {tmp_path / rel}"
 
 
-def test_28_cli_digest_no_annotation(client: Client, tmp_path: Path):
-  d = _first_digest_with_annotation(client)
-  r = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-annotation")
-  assert r.returncode == 0, f"stderr: {r.stderr}"
-  assert d.id in r.stdout
-  assert list(tmp_path.iterdir()) == [], "--no-annotation must not render"
-
-
-def test_29_cli_digest_on_highlight_without_annotation(client: Client, tmp_path: Path):
+def test_28_cli_digest_no_handwriting(client: Client, tmp_path: Path):
+  """`digest <id>` on a highlight-only digest returns null image + annotation."""
   d = _first_digest_without_annotation(client)
-  r = _run_cli("digest", d.id, "-o", str(tmp_path))
+  r = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
   assert r.returncode == 0, f"stderr: {r.stderr}"
-  assert list(tmp_path.iterdir()) == []
-  assert "no annotation" in r.stderr
+  data = json.loads(r.stdout)
+  assert data["id"] == d.id
+  assert data["handwritten_image"] is None
+  assert data["annotation"] is None
+  # No attachments directory contents created for an empty render
+  attachments = tmp_path / "attachments"
+  if attachments.exists():
+    assert list(attachments.iterdir()) == []
 
 
-def test_30_cli_digest_already_exists(client: Client, tmp_path: Path):
+def test_29_cli_digest_multi_ids_array(client: Client, tmp_path: Path):
+  """Multiple comma-separated ids produce a JSON array."""
+  d1 = _first_digest_with_annotation(client)
+  d2 = _first_digest_without_annotation(client)
+  r = _run_cli("digest", f"{d1.id},{d2.id}", "-o", str(tmp_path), "--no-ocr")
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  data = json.loads(r.stdout)
+  assert isinstance(data, list)
+  assert {x["id"] for x in data} == {d1.id, d2.id}
+
+
+def test_30_cli_digest_skip_existing(client: Client, tmp_path: Path):
+  """Second invocation should not rewrite the PNG; handwritten_image still points to it."""
   d = _first_digest_with_annotation(client)
-  r1 = _run_cli("digest", d.id, "-o", str(tmp_path))
+  r1 = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
   assert r1.returncode == 0
-  assert "rendered:" in r1.stderr
-  r2 = _run_cli("digest", d.id, "-o", str(tmp_path))
+  data1 = json.loads(r1.stdout)
+  img_rel = data1["handwritten_image"]
+  paths1 = [img_rel] if isinstance(img_rel, str) else img_rel
+  mtimes = {p: (tmp_path / p).stat().st_mtime_ns for p in paths1}
+
+  r2 = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
   assert r2.returncode == 0
-  assert "already exists:" in r2.stderr
-  assert "rendered:" not in r2.stderr
+  data2 = json.loads(r2.stdout)
+  assert data2["handwritten_image"] == img_rel
+  for p, mt in mtimes.items():
+    assert (tmp_path / p).stat().st_mtime_ns == mt, f"{p} was re-written without --force"
 
 
 def test_31_render_handwriting_file_path(client: Client, tmp_path: Path):
-  """`out` ending in .png should be used as the target filename directly."""
+  """API-level: `out` ending in .png should still work for programmatic users."""
   d = _first_digest_with_annotation(client)
   target = tmp_path / "my_annotation.png"
   paths = api.render_handwriting(client, d, target)
   assert paths == [target] or (paths and paths[0] == target)
   assert target.exists()
   assert target.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-
-
-def test_32_cli_digest_file_path_output(client: Client, tmp_path: Path):
-  """`supernote digest <id> -o foo.png` writes to foo.png, not foo.png/<id>.png."""
-  d = _first_digest_with_annotation(client)
-  target = tmp_path / "tmp.png"
-  r = _run_cli("digest", d.id, "-o", str(target))
-  assert r.returncode == 0, f"stderr: {r.stderr}"
-  assert target.exists(), f"expected {target}; got tree: {list(tmp_path.iterdir())}"
-  assert target.is_file(), f"{target} should be a file, not a directory"
-  # No {digest_id}.png inside should exist — that would be the old buggy behavior
-  buggy = target / f"{d.id}.png"
-  assert not buggy.exists(), "regression: CLI created a dir with digest_id.png inside"
-
-
-def test_33_cli_digest_file_path_multi_id_errors(client: Client, tmp_path: Path):
-  d = _first_digest_with_annotation(client)
-  target = tmp_path / "tmp.png"
-  r = _run_cli("digest", f"{d.id},{d.id}", "-o", str(target))
-  assert r.returncode != 0
-  assert (
-    "looks like a filename" in r.stderr
-    or "multiple" in r.stderr.lower()
-    or "digest IDs" in r.stderr
-  )
 
 
 # ---------- Sources ----------
@@ -552,17 +552,201 @@ def test_44_cli_note_ls_json(client):
     assert entry["file_name"].endswith(".note")
 
 
-def test_45_cli_note_ocr_by_id_json(client, tmp_path):
+def test_45_cli_note_by_id_json(client, tmp_path):
+  """`note <id>` emits JSON array with v0.2 schema; PNGs under {-o}/attachments/."""
   file_id = _smallest_cloud_note_id(client)
   out = tmp_path / "cli_cloud_ocr"
-  r = _run_cli("note", file_id, "--out", str(out), "--json")
-  # Command should return 0 even if Ollama is unreachable (ocr_text is None then).
+  r = _run_cli("note", file_id, "-o", str(out), "--no-ocr")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert isinstance(data, list)
   assert len(data) >= 1
   for entry in data:
-    assert set(entry) == {"index", "png_path", "transcript", "ocr_text"}
-  # PNG files really exist on disk
-  for entry in data:
-    assert Path(entry["png_path"]).exists()
+    assert set(entry) == {"page", "transcript", "annotation", "handwritten_image"}
+    assert entry["annotation"] is None, "--no-ocr must null out annotation"
+    assert entry["handwritten_image"].startswith("attachments/")
+    assert (out / entry["handwritten_image"]).exists()
+
+
+# ---------- Upload round-trip (self-cleaning) ----------
+
+UPLOAD_TEST_DIR = "Document"  # v0.1 test-area; files are cleaned up in `finally`
+
+
+def _upload_test_filename() -> str:
+  import uuid
+  return f"_supernote_cli_test_{uuid.uuid4().hex[:8]}.txt"
+
+
+def _unique_bytes(prefix: bytes = b"cli-e2e") -> bytes:
+  """Fresh per call — avoids Supernote's server-side md5 dedup."""
+  import uuid
+  return prefix + b"\n" + uuid.uuid4().bytes * 16
+
+
+def test_46_upload_roundtrip(client: Client, tmp_path: Path):
+  """Upload a tiny local file, verify via ls, download, md5 match, delete."""
+  name = _upload_test_filename()
+  src = tmp_path / name
+  payload = _unique_bytes(b"roundtrip")
+  src.write_bytes(payload)
+  expected_md5 = hashlib.md5(payload).hexdigest()
+
+  note = None
+  try:
+    note = api.upload_file(client, src, UPLOAD_TEST_DIR)
+    assert note.file_name == name
+    assert note.size == len(payload)
+
+    # Appears in ls
+    _, contents = api.resolve_path(client, UPLOAD_TEST_DIR)
+    assert any(n.file_name == name and not n.is_folder for n in contents)
+
+    # Download and compare
+    dest = tmp_path / "roundtrip" / name
+    api.download_file(client, note.id, dest)
+    assert hashlib.md5(dest.read_bytes()).hexdigest() == expected_md5
+  finally:
+    if note is not None:
+      api.delete_file(client, note)
+
+
+def test_47_upload_missing_remote_dir_errors(client: Client, tmp_path: Path):
+  """Uploading to a nonexistent folder fails cleanly (no auto-mkdir)."""
+  src = tmp_path / "nope.txt"
+  src.write_bytes(b"x")
+  with pytest.raises(ApiError):
+    api.upload_file(client, src, "Document/_definitely_does_not_exist_xyz")
+
+
+def test_48_upload_skip_then_overwrite(client: Client, tmp_path: Path):
+  """Second upload without --overwrite errors; with --overwrite it replaces."""
+  name = _upload_test_filename()
+  src = tmp_path / name
+  first_bytes = _unique_bytes(b"first")
+  src.write_bytes(first_bytes)
+  uploaded_notes: list = []
+  try:
+    first = api.upload_file(client, src, UPLOAD_TEST_DIR)
+    uploaded_notes.append(first)
+
+    # Same name again -> error
+    with pytest.raises(ApiError, match="already exists"):
+      api.upload_file(client, src, UPLOAD_TEST_DIR)
+
+    # With overwrite -> new note, old id no longer resolvable
+    second_bytes = _unique_bytes(b"second")
+    src.write_bytes(second_bytes)
+    second = api.upload_file(client, src, UPLOAD_TEST_DIR, overwrite=True)
+    assert second.id != first.id
+    assert second.size == len(second_bytes)
+    uploaded_notes = [second]  # first was deleted by overwrite path
+  finally:
+    for n in uploaded_notes:
+      try:
+        api.delete_file(client, n)
+      except ApiError:
+        pass
+
+
+def test_49_cli_upload_roundtrip(client: Client, tmp_path: Path):
+  """CLI upload verb: happy path + visible via ls, cleaned up afterward."""
+  name = _upload_test_filename()
+  src = tmp_path / name
+  src.write_bytes(_unique_bytes(b"cli-smoke"))
+
+  uploaded_note = None
+  try:
+    r = _run_cli("upload", str(src), UPLOAD_TEST_DIR + "/")
+    assert r.returncode == 0, f"stderr: {r.stderr}"
+    assert name in r.stdout
+    # Resolve note for cleanup
+    _, contents = api.resolve_path(client, UPLOAD_TEST_DIR)
+    uploaded_note = next((n for n in contents if n.file_name == name and not n.is_folder), None)
+    assert uploaded_note is not None, "uploaded file not visible via ls"
+  finally:
+    if uploaded_note is not None:
+      api.delete_file(client, uploaded_note)
+
+
+def test_50_cli_download_path_based(client: Client, tmp_path: Path):
+  """`download <remote-path>` (without --by-id) resolves by path."""
+  # Upload a seed so we know exactly what path to download
+  name = _upload_test_filename()
+  src = tmp_path / name
+  payload = _unique_bytes(b"path-dl")
+  src.write_bytes(payload)
+  expected_md5 = hashlib.md5(payload).hexdigest()
+
+  note = None
+  try:
+    note = api.upload_file(client, src, UPLOAD_TEST_DIR)
+
+    dest = tmp_path / "dl" / name
+    r = _run_cli("download", f"{UPLOAD_TEST_DIR}/{name}", "-o", str(dest))
+    assert r.returncode == 0, f"stderr: {r.stderr}"
+    assert dest.exists()
+    assert hashlib.md5(dest.read_bytes()).hexdigest() == expected_md5
+  finally:
+    if note is not None:
+      api.delete_file(client, note)
+
+
+def test_51_cli_download_by_id(client: Client, tmp_path: Path):
+  """`download --by-id <id>` keeps working as an escape hatch."""
+  target = _pick_small_note(client)
+  dest = tmp_path / "byid.note"
+  r = _run_cli("download", "--by-id", target.id, "-o", str(dest))
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  assert dest.exists()
+  assert dest.stat().st_size == target.size
+
+
+# ---------- Fixture-based .note round-trip ----------
+
+_FIXTURE_NOTE = Path(__file__).parent / "fixtures" / "sample.note"
+
+
+@pytest.mark.skipif(not _FIXTURE_NOTE.exists(), reason=f"{_FIXTURE_NOTE} missing")
+def test_52_fixture_note_roundtrip(client: Client, tmp_path: Path):
+  """Upload tests/fixtures/sample.note, render pages, download back, md5 match, delete.
+
+  Populate the fixture once (from any `.note` in your account):
+    supernote note ls --json --limit 1 | jq -r '.[0].id' | \\
+      xargs -I{} supernote download --by-id {} -o tests/fixtures/sample.note
+  """
+  name = _upload_test_filename().replace(".txt", ".note")
+  remote_dir = UPLOAD_TEST_DIR  # .note files can live under /Document
+  expected_md5 = hashlib.md5(_FIXTURE_NOTE.read_bytes()).hexdigest()
+
+  note = None
+  try:
+    # Copy fixture to a named path so the remote filename matches
+    staged = tmp_path / name
+    staged.write_bytes(_FIXTURE_NOTE.read_bytes())
+
+    try:
+      note = api.upload_file(client, staged, remote_dir)
+    except ApiError as e:
+      if "identical md5" in str(e):
+        pytest.skip(
+          "server deduped by md5 — the fixture .note already exists in your "
+          "cloud. Replace tests/fixtures/sample.note with a .note that isn't "
+          "already uploaded."
+        )
+      raise
+
+    # Download by path
+    dest = tmp_path / "rt" / name
+    api.download_file(client, note.id, dest)
+    assert hashlib.md5(dest.read_bytes()).hexdigest() == expected_md5
+
+    # Render pages (doesn't require Ollama)
+    pngs = api.render_note(dest, tmp_path / "rendered")
+    assert pngs, "expected at least one page rendered from fixture .note"
+    for p in pngs:
+      assert p.exists()
+      assert p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+  finally:
+    if note is not None:
+      api.delete_file(client, note)
