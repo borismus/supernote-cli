@@ -11,3 +11,7 @@ build/
 # Stray outputs from ad-hoc `supernote digest ... -o .` runs in the repo root
 /*.png
 /*.mark
+# Agent sandbox state
+.claude/
+# Personal .note files used for live-test fixtures; never commit these
+tests/fixtures/
