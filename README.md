@@ -4,6 +4,14 @@ CLI and Python client for the Supernote cloud API (`viewer.supernote.com`).
 
 ## Install
 
+`supernote-cli` depends on `supernotelib`, which pulls in `pycairo` for note rendering. On macOS, that means you need the native Cairo toolchain installed externally before `uv` can build the Python package:
+
+```bash
+brew install pkg-config cairo
+```
+
+Then install the project:
+
 ```
 uv tool install git+https://github.com/bsmus/supernote-cli  # once published
 # or from a local checkout:
