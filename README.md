@@ -46,12 +46,12 @@ supernote sync <path> -o DIR \
 supernote source ls [--days-ago N] [--limit N] [--json]
 
 supernote digest ls [--limit N] [--days-ago N] [--json]
-supernote digest <id>[,<id>...] \                     # JSON with digest/annotation/handwritten_image
-         [-o DIR] [--no-ocr] [--model M] [--force]
+supernote digest <id>[,<id>...] \                     # markdown to stdout (--json for v0.2 JSON)
+         [--dir DIR] [--no-ocr] [--model M] [--force] [--json]
 
 supernote note ls [--days-ago N] [--limit N] [--json]
-supernote note <file-id> \                            # JSON per-page array; renders + Ollama OCR
-         [-o DIR] [--no-ocr] [--model M] [--force]
+supernote note <file-id> \                            # markdown to stdout (--json for v0.2 JSON)
+         [--dir DIR] [--no-ocr] [--model M] [--force] [--json]
 ```
 
 Global flags: `--no-cache`, `--verbose`, `--equipment-no`.
@@ -60,31 +60,57 @@ Global flags: `--no-cache`, `--verbose`, `--equipment-no`.
 
 Most commands take a remote path (`Note/Inbox/foo.note`). `download` and `delete` also accept `--by-id <ID>` as an escape hatch. `upload` expects the destination folder to already exist — it won't create missing folders. `delete` removes the remote file immediately with no confirmation prompt; `upload --overwrite` uses it internally and waits for the deletion to propagate server-side before re-uploading.
 
-### `digest <id>` — JSON output
+### `digest <id>` — markdown by default; `--json` for structured
 
-`digest <id>` prints a JSON record using Supernote's own terminology:
+The default emits a light blockquote-then-OCR markdown to stdout, no files:
+
+```
+$ supernote digest 832783777540341760
+> I've decided to throw my chemoreceptors into the ring...
+
+could this be something for dad to look into?
+```
+
+- The `>` block is the highlighted passage Supernote already transcribed (`digest.content`).
+- The body below is the Ollama OCR of the handwritten note you drew on top.
+- Highlight-only digests (no handwriting) print just the blockquote.
+- `--no-ocr` skips the OCR step (fast path).
+
+Pass `--dir DIR` to also persist `page_N.png` + `content.md` (byte-identical to stdout) into DIR. On re-run, `content.md` is the cache — instant unless `--force`.
+
+Pass `--json` for the structured shape (Supernote's own terms):
 
 ```json
 {
   "id": "832783687476051968",
   "digest": "just as we've become a culture of overeaters...",
   "annotation": "completely correlated",
-  "handwritten_image": "attachments/832783687476051968.png",
+  "handwritten_image": "page_1.png",
   "source_path": "/Document/Breath.epub",
   "last_modified": "2026-04-18T11:42:00"
 }
 ```
 
-- `digest` — the highlighted passage (Supernote's device transcription).
-- `annotation` — Ollama OCR of your handwritten note drawn on top. `null` when `--no-ocr` or there's no annotation.
-- `handwritten_image` — path to the rendered PNG, relative to `-o` (default CWD). `null` when no annotation. Array for multi-page.
-- Multiple comma-separated IDs produce a JSON array.
+`--json` and `--dir` compose: JSON to stdout, files to DIR. Without `--dir`, `handwritten_image` is `null`. With multi-page handwriting it's an array.
 
-OCR runs by default; pass `--no-ocr` to skip it (no Ollama round trip). With OCR on, Ollama must be reachable — if not, the command exits 2 with a clear error.
+Multiple comma-separated IDs print one markdown block per digest (separated by a blank line) or a JSON array. `--dir` requires a single ID.
 
-### `note <id>` — JSON output
+### `note <id>` — markdown by default; `--json` for structured
 
-`note <id>` downloads the cloud `.note` to a tempfile, renders each page to PNG under `{-o}/attachments/`, and runs Ollama OCR per page. Output is a JSON array:
+Default: markdown per page to stdout, no files.
+
+```
+$ supernote note 1251704781014040577
+## Page 1
+
+The role I'd want at OpenAI on Justin Uberti's team would be ...
+
+## Page 2
+
+...
+```
+
+Pass `--dir DIR` to also persist `page_N.png` + `content.md` and enable cache-on-rerun. Pass `--json` for the v0.2 per-page structured array:
 
 ```json
 [
@@ -92,12 +118,12 @@ OCR runs by default; pass `--no-ocr` to skip it (no Ollama round trip). With OCR
     "page": 1,
     "transcript": "device OCR text from supernotelib",
     "annotation": "Ollama OCR text",
-    "handwritten_image": "attachments/1138647043762290688-p1.png"
+    "handwritten_image": "page_1.png"
   }
 ]
 ```
 
-Default `-o` is `./note-{id}/`. `transcript` is the on-device OCR (may be empty); `annotation` is Ollama's read of the PNG.
+Without `--dir`, `handwritten_image` is `null`.
 
 ### Ollama
 
@@ -114,12 +140,17 @@ c = Client.from_env()             # loads .env + cached token
 for folder_path, note in api.list_notes(c):
     print(note.id, f"{folder_path}/{note.file_name}")
 
+# Build the same markdown the CLI prints. Pass dir="..." to also persist
+# page_N.png + content.md and enable cache-on-rerun.
+md = api.render_digest_markdown(c, digest)                     # blockquote + OCR
+md = api.render_note_markdown(c, file_id, dir="/tmp/mynote")   # per-page OCR + cache
+
 # Group digests by source document (PDF/EPUB) and get full Digest records
 for src in api.list_digested_sources(c, days_ago=30):
     print(src.source_stem, len(src.digests))
-    # Render each digest's handwritten annotation to PNG
+    # Lower-level: render handwriting PNGs only (no OCR)
     for d in src.digests:
-        paths = api.render_handwriting(c, d, out="/tmp/hw")
+        paths = api.render_handwriting(c, d, "/tmp/hw")  # writes page_N.png
         if paths:
             print(d.id, "->", paths)
 
