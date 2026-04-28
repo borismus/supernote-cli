@@ -67,34 +67,66 @@ def _build_parser() -> argparse.ArgumentParser:
   dg = sub.add_parser(
     "digest",
     help="digest (highlight + annotation) commands",
-    description="Run `digest ls` to list, or `digest <id>[,id...]` to print JSON records.",
+    description=(
+      "Run `digest ls` to list digest summary records. With one or more "
+      "comma-separated digest IDs, print markdown to stdout (blockquoted "
+      "highlight + OCR of the handwritten annotation). Use --json for the "
+      "v0.2 JSON shape, or --dir DIR to also persist page_N.png + content.md."
+    ),
   )
   dg.add_argument("target", help="'ls' to list, or digest id(s) comma-separated")
   # ls
-  dg.add_argument("--limit", type=int, default=20, help="max records to list")
-  dg.add_argument("--days-ago", dest="days_ago", type=int, help="only include digests modified within N days")
-  dg.add_argument("--json", dest="as_json", action="store_true", help="JSON output (ls only; id form is always JSON)")
+  dg.add_argument("--limit", type=int, default=20, help="(ls only) max records to list")
+  dg.add_argument("--days-ago", dest="days_ago", type=int, help="(ls only) only include digests modified within N days")
+  # both
+  dg.add_argument(
+    "--json",
+    dest="as_json",
+    action="store_true",
+    help="emit JSON instead of markdown (id form) / table (ls form)",
+  )
   # <id>
-  dg.add_argument("-o", "--output", default=".", help="output directory; PNGs go under {output}/attachments/")
-  dg.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="skip Ollama OCR of the handwritten annotation")
-  dg.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"Ollama vision model (default: {ocr.DEFAULT_MODEL})")
-  dg.add_argument("--force", action="store_true", help="overwrite existing handwritten_image PNGs")
+  dg.add_argument(
+    "--dir",
+    dest="dir",
+    default=None,
+    help="(id form) directory to persist page_N.png + content.md; cache-on-rerun unless --force",
+  )
+  dg.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="(id form) skip Ollama OCR of the handwritten annotation")
+  dg.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  dg.add_argument("--force", action="store_true", help="(id form) ignore cached content.md and re-render/re-OCR")
 
   nt = sub.add_parser(
     "note",
     help=".note file commands",
-    description="Run `note ls` to list, or `note <id>` to print a JSON per-page array.",
+    description=(
+      "Run `note ls` to list .note files under /Note/. With a numeric file id, "
+      "OCR each page via Ollama vision and print markdown to stdout. Use "
+      "--json for the v0.2 per-page JSON, or --dir DIR to also persist "
+      "page_N.png + content.md."
+    ),
   )
   nt.add_argument("target", help="'ls' to list .note files, or a cloud file id to fetch one")
   # ls
-  nt.add_argument("--limit", type=int, default=50, help="max records to list")
-  nt.add_argument("--days-ago", dest="days_ago", type=int, help="only include files modified within N days")
-  nt.add_argument("--json", dest="as_json", action="store_true", help="JSON output (ls only; id form is always JSON)")
+  nt.add_argument("--limit", type=int, default=50, help="(ls only) max records to list")
+  nt.add_argument("--days-ago", dest="days_ago", type=int, help="(ls only) only include files modified within N days")
+  # both
+  nt.add_argument(
+    "--json",
+    dest="as_json",
+    action="store_true",
+    help="emit JSON instead of markdown (id form) / table (ls form)",
+  )
   # <id>
-  nt.add_argument("-o", "--output", help="output directory (default: ./note-{id}/); PNGs go under {output}/attachments/")
-  nt.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="skip Ollama OCR on each page")
-  nt.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"Ollama vision model (default: {ocr.DEFAULT_MODEL})")
-  nt.add_argument("--force", action="store_true", help="overwrite existing page PNGs")
+  nt.add_argument(
+    "--dir",
+    dest="dir",
+    default=None,
+    help="(id form) directory to persist page_N.png + content.md; cache-on-rerun unless --force",
+  )
+  nt.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="(id form) skip Ollama OCR on each page")
+  nt.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  nt.add_argument("--force", action="store_true", help="(id form) ignore cached content.md and re-render/re-OCR")
 
   return p
 
@@ -294,11 +326,15 @@ def _digest_ls(args) -> int:
 def _digest_show(args) -> int:
   c = _client_from_args(args)
   ids = [i.strip() for i in args.target.split(",") if i.strip()]
-  out_dir = Path(args.output)
-  attachments_dir = out_dir / "attachments"
 
-  runner = _OcrRunner(enabled=not args.no_ocr, model=args.model)
-  if runner.enabled:
+  if args.dir is not None and len(ids) > 1:
+    print(
+      "error: --dir is per-digest; pass a single id or run multiple commands",
+      file=sys.stderr,
+    )
+    return 2
+
+  if not args.no_ocr:
     try:
       ocr.check_available()
     except ocr.OcrError as e:
@@ -307,60 +343,76 @@ def _digest_show(args) -> int:
 
   digests = api.fetch_digests_by_ids(c, ids)
   by_id = {d.id: d for d in digests}
-  records = []
-  for did in ids:
+
+  if args.as_json:
+    records = []
+    for did in ids:
+      d = by_id.get(did)
+      if d is None:
+        print(f"warning: digest {did} not found", file=sys.stderr)
+        continue
+      records.append(_digest_json_record(c, d, args))
+    print(json.dumps(records[0] if len(records) == 1 else records, indent=2))
+    return 0
+
+  # Markdown path.
+  for i, did in enumerate(ids):
     d = by_id.get(did)
     if d is None:
       print(f"warning: digest {did} not found", file=sys.stderr)
       continue
-    records.append(_digest_record(c, d, attachments_dir, out_dir, runner, force=args.force))
-
-  print(json.dumps(records[0] if len(records) == 1 else records, indent=2))
+    md = api.render_digest_markdown(
+      c, d,
+      ocr_model=args.model,
+      no_ocr=args.no_ocr,
+      force=args.force,
+      dir=args.dir,
+    )
+    if i > 0:
+      sys.stdout.write("\n")
+    sys.stdout.write(md)
+    if not md.endswith("\n"):
+      sys.stdout.write("\n")
   return 0
 
 
-def _digest_record(c, digest, attachments_dir, out_dir, runner, *, force: bool) -> dict:
+def _digest_json_record(c, digest, args) -> dict:
+  """Build a v0.2-shaped JSON record for a digest, leveraging --dir cache."""
+  # Always materialize markdown first (handles cache + fresh work uniformly),
+  # then parse it back to extract the OCR'd annotation text.
+  md = api.render_digest_markdown(
+    c, digest,
+    ocr_model=args.model,
+    no_ocr=args.no_ocr,
+    force=args.force,
+    dir=args.dir,
+  )
+  _, annotation = api._parse_digest_markdown(md)
+
   rec: dict = {
     "id": digest.id,
     "digest": digest.content or "",
-    "annotation": None,
+    "annotation": annotation,
     "handwritten_image": None,
     "source_path": digest.source_path,
     "last_modified": digest.last_modified_time.isoformat() if digest.last_modified_time else None,
   }
-  if not digest.has_annotation:
-    return rec
-  png_paths = api.render_handwriting(c, digest, attachments_dir, force=force)
-  if not png_paths:
-    png_paths = _existing_handwriting_paths(attachments_dir, digest.id)
-  rel_paths = [str(p.relative_to(out_dir)) if _is_relative_to(p, out_dir) else str(p) for p in png_paths]
-  if rel_paths:
-    rec["handwritten_image"] = rel_paths[0] if len(rel_paths) == 1 else rel_paths
-  if runner.enabled and png_paths:
-    ocr_texts = [runner.run(p) for p in png_paths]
-    joined = "\n".join(t for t in ocr_texts if t)
-    rec["annotation"] = joined or None
+
+  if args.dir is not None and digest.has_annotation:
+    rels = _list_page_pngs(Path(args.dir))
+    if rels:
+      rec["handwritten_image"] = rels[0] if len(rels) == 1 else rels
   return rec
 
 
-def _existing_handwriting_paths(attachments_dir: Path, digest_id: str) -> list[Path]:
-  single = attachments_dir / f"{digest_id}.png"
-  if single.exists():
-    return [single]
-  found = []
-  n = 0
-  while (p := attachments_dir / f"{digest_id}_p{n + 1}.png").exists():
-    found.append(p)
+def _list_page_pngs(dir: Path) -> list[str]:
+  """Enumerate `page_N.png` filenames in `dir`, sorted by N."""
+  out = []
+  n = 1
+  while (dir / f"page_{n}.png").exists():
+    out.append(f"page_{n}.png")
     n += 1
-  return found
-
-
-def _is_relative_to(p: Path, base: Path) -> bool:
-  try:
-    p.relative_to(base)
-    return True
-  except ValueError:
-    return False
+  return out
 
 
 def _cmd_note(args) -> int:
@@ -398,68 +450,99 @@ def _note_ls(args) -> int:
 def _note_show(args) -> int:
   c = _client_from_args(args)
   file_id = args.target
-  out_dir = Path(args.output) if args.output else Path.cwd() / f"note-{file_id}"
-  attachments_dir = out_dir / "attachments"
-  attachments_dir.mkdir(parents=True, exist_ok=True)
 
-  runner = _OcrRunner(enabled=not args.no_ocr, model=args.model)
-  if runner.enabled:
+  if not args.no_ocr:
     try:
       ocr.check_available()
     except ocr.OcrError as e:
       print(f"error: {e}", file=sys.stderr)
       return 2
 
-  with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
-    api.download_file(c, file_id, Path(tmp.name))
-    png_paths = api.render_note(tmp.name, attachments_dir, force=args.force)
-    transcripts = api.extract_note_text(tmp.name)
+  if args.as_json:
+    rec = _note_json_record(c, file_id, args)
+    print(json.dumps(rec, indent=2))
+    return 0
 
-  # Rename page PNGs to the `{file_id}-p{N}.png` scheme for stable references.
-  renamed: list[Path] = []
-  for i, p in enumerate(png_paths):
-    dest = attachments_dir / f"{file_id}-p{i + 1}.png"
-    if p != dest:
-      if dest.exists() and not args.force:
-        p.unlink(missing_ok=True)
-      else:
-        p.replace(dest)
-    renamed.append(dest)
-
-  records = []
-  for i, png in enumerate(renamed):
-    rel = str(png.relative_to(out_dir)) if _is_relative_to(png, out_dir) else str(png)
-    records.append({
-      "page": i + 1,
-      "transcript": (transcripts[i] if i < len(transcripts) else "") or None,
-      "annotation": runner.run(png) if runner.enabled and png.exists() else None,
-      "handwritten_image": rel,
-    })
-  print(json.dumps(records, indent=2))
+  md = api.render_note_markdown(
+    c, file_id,
+    ocr_model=args.model,
+    no_ocr=args.no_ocr,
+    force=args.force,
+    dir=args.dir,
+  )
+  sys.stdout.write(md)
+  if not md.endswith("\n"):
+    sys.stdout.write("\n")
   return 0
 
 
-class _OcrRunner:
-  """Runs `ocr_image` per path, giving up after the first error per invocation.
+def _note_json_record(c, file_id, args) -> list[dict]:
+  """Build the v0.2-shaped per-page JSON for a .note, leveraging --dir cache.
 
-  On first error, prints the error to stderr and returns None for all
-  subsequent calls. Callers should still respect `enabled` to skip entirely.
+  When --dir is given, we always have page_N.png on disk after the call;
+  we materialize markdown (cache or fresh), parse OCR back out, and pair
+  it with on-disk PNG names.
+
+  When --dir is None, we still need transcripts (device OCR) and PNG
+  paths, which the markdown helper doesn't expose. Fall back to the
+  underlying ocr_note_from_cloud, but skip OCR if --no-ocr.
   """
+  if args.dir is not None:
+    md = api.render_note_markdown(
+      c, file_id,
+      ocr_model=args.model,
+      no_ocr=args.no_ocr,
+      force=args.force,
+      dir=args.dir,
+    )
+    page_ocr = dict(api._parse_note_markdown(md))
+    # Device transcripts aren't cached on disk; re-fetch via supernotelib by
+    # downloading the .note again. Fast enough for the JSON path.
+    with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
+      api.download_file(c, file_id, Path(tmp.name))
+      transcripts = api.extract_note_text(tmp.name)
+    pngs = _list_page_pngs(Path(args.dir))
+    records = []
+    for i, png in enumerate(pngs):
+      records.append({
+        "page": i + 1,
+        "transcript": (transcripts[i] if i < len(transcripts) else "") or None,
+        "annotation": page_ocr.get(i + 1) or None,
+        "handwritten_image": png,
+      })
+    return records
 
-  def __init__(self, *, enabled: bool, model: str):
-    self.enabled = enabled
-    self.model = model
-    self._errored = False
-
-  def run(self, path: Path) -> str | None:
-    if not self.enabled or self._errored:
-      return None
-    try:
-      return ocr.ocr_image(path, model=self.model)
-    except ocr.OcrError as e:
-      print(f"ollama error: {e}", file=sys.stderr)
-      self._errored = True
-      return None
+  # No --dir: do the full pipeline in a tempdir; emit JSON without persisting.
+  with tempfile.TemporaryDirectory() as td:
+    workdir = Path(td)
+    if args.no_ocr:
+      with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
+        api.download_file(c, file_id, Path(tmp.name))
+        api.render_note(tmp.name, workdir, force=args.force)
+        transcripts = api.extract_note_text(tmp.name)
+      pages = [
+        api.NotePage(
+          index=i + 1,
+          png_path=workdir / f"page_{i + 1}.png",
+          transcript=(transcripts[i] if i < len(transcripts) else "") or None,
+          ocr_text=None,
+        )
+        for i in range(len(transcripts))
+      ]
+    else:
+      pages = api.ocr_note_from_cloud(
+        c, file_id, workdir, model=args.model, force=args.force
+      )
+  return [
+    {
+      "page": p.index,
+      "transcript": p.transcript,
+      "annotation": p.ocr_text,
+      "handwritten_image": None,
+    }
+    for p in pages
+  ]
+  return 0
 
 
 def _note_dict(n) -> dict:

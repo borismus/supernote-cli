@@ -269,19 +269,17 @@ def _first_digest_without_annotation(client: Client):
   return d
 
 
-def test_23_render_handwriting_single_page(client: Client, tmp_path: Path):
+def test_23_render_handwriting_page_names(client: Client, tmp_path: Path):
   d = _first_digest_with_annotation(client)
   paths = api.render_handwriting(client, d, tmp_path)
   assert len(paths) >= 1
   p = paths[0]
   assert p.exists()
-  # single-page filename is bare {id}.png; multi-page would be _p{N}
-  assert p.name == f"{d.id}.png" or p.name.startswith(f"{d.id}_p")
-  # PNG magic bytes
+  assert p.name == "page_1.png"
   assert p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_24_render_handwriting_none_when_no_comment(client: Client, tmp_path: Path):
+def test_24_render_handwriting_empty_when_no_annotation(client: Client, tmp_path: Path):
   from supernote_cli.models import Digest
 
   fake = Digest(
@@ -299,11 +297,10 @@ def test_24_render_handwriting_none_when_no_comment(client: Client, tmp_path: Pa
 def test_25_render_handwriting_skip_existing(client: Client, tmp_path: Path):
   d = _first_digest_with_annotation(client)
   first = api.render_handwriting(client, d, tmp_path)
-  assert first, "first render should write at least one file"
+  assert first
   mtimes = {p: p.stat().st_mtime_ns for p in first}
   second = api.render_handwriting(client, d, tmp_path)
-  assert second == [], "second call should skip and return []"
-  # Existing files not modified
+  assert second == first, "second call returns same paths"
   for p, mt in mtimes.items():
     assert p.stat().st_mtime_ns == mt, f"{p} was re-written"
 
@@ -317,82 +314,88 @@ def test_26_render_handwriting_force_rewrites(client: Client, tmp_path: Path):
 
   _time.sleep(0.01)
   rewritten = api.render_handwriting(client, d, tmp_path, force=True)
-  assert rewritten == first, "force should rewrite the same page(s)"
+  assert rewritten == first
   for p, mt in before.items():
-    assert p.stat().st_mtime_ns >= mt, f"{p} should have been re-written"
+    assert p.stat().st_mtime_ns >= mt
 
 
-def test_27_cli_digest_json_shape(client: Client, tmp_path: Path):
-  """`digest <id>` with annotation prints JSON object using Supernote terms."""
+def test_27_cli_digest_markdown_default(client: Client, tmp_path: Path):
+  """Default (no --json, no --dir): markdown to stdout, nothing on disk."""
   d = _first_digest_with_annotation(client)
-  r = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
+  r = _run_cli("digest", d.id, "--no-ocr", cwd=tmp_path)
   assert r.returncode == 0, f"stderr: {r.stderr}"
-  data = json.loads(r.stdout)
-  assert data["id"] == d.id
-  assert "digest" in data  # highlight content
-  assert data["annotation"] is None, "--no-ocr must null out annotation"
-  assert data["handwritten_image"], "expected handwritten_image path in JSON"
-  assert "source_path" in data
-  assert "last_modified" in data
-  # PNG really on disk under {-o}/attachments/
-  img = data["handwritten_image"]
-  paths = [img] if isinstance(img, str) else img
-  for rel in paths:
-    assert (tmp_path / rel).exists(), f"missing: {tmp_path / rel}"
+  assert r.stdout.startswith(">") or "\n>" in r.stdout
+  assert list(tmp_path.iterdir()) == []
 
 
 def test_28_cli_digest_no_handwriting(client: Client, tmp_path: Path):
-  """`digest <id>` on a highlight-only digest returns null image + annotation."""
+  """A digest without handwriting produces just the blockquote in markdown."""
   d = _first_digest_without_annotation(client)
-  r = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
+  r = _run_cli("digest", d.id, cwd=tmp_path)
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  non_quote_lines = [ln for ln in r.stdout.splitlines() if ln.strip() and not ln.startswith(">")]
+  assert non_quote_lines == [], f"unexpected non-quote lines: {non_quote_lines}"
+
+
+def test_29_cli_digest_dir_writes_content_and_pages(client: Client, tmp_path: Path):
+  d = _first_digest_with_annotation(client)
+  out = tmp_path / "d"
+  r = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out))
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  assert (out / "content.md").exists()
+  assert (out / "page_1.png").exists()
+  cm = (out / "content.md").read_text()
+  cm_norm = cm if cm.endswith("\n") else cm + "\n"
+  stdout_norm = r.stdout if r.stdout.endswith("\n") else r.stdout + "\n"
+  assert cm_norm == stdout_norm
+
+
+def test_30_cli_digest_dir_cache_hit(client: Client, tmp_path: Path):
+  d = _first_digest_with_annotation(client)
+  out = tmp_path / "d"
+  r1 = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out))
+  assert r1.returncode == 0
+  m1 = (out / "page_1.png").stat().st_mtime_ns
+  import time as _time
+
+  _time.sleep(0.01)
+  r2 = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out))
+  assert r2.returncode == 0
+  assert r2.stdout == r1.stdout
+  # PNG should not have been re-written
+  assert (out / "page_1.png").stat().st_mtime_ns == m1
+
+
+def test_31_cli_digest_json_shape(client: Client, tmp_path: Path):
+  """--json emits the v0.2 JSON shape using Supernote terminology."""
+  d = _first_digest_with_annotation(client)
+  out = tmp_path / "d"
+  r = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out), "--json")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert data["id"] == d.id
-  assert data["handwritten_image"] is None
-  assert data["annotation"] is None
-  # No attachments directory contents created for an empty render
-  attachments = tmp_path / "attachments"
-  if attachments.exists():
-    assert list(attachments.iterdir()) == []
+  assert "digest" in data
+  assert data["annotation"] is None  # --no-ocr
+  assert data["handwritten_image"] == "page_1.png"
+  assert "source_path" in data
+  assert "last_modified" in data
 
 
-def test_29_cli_digest_multi_ids_array(client: Client, tmp_path: Path):
-  """Multiple comma-separated ids produce a JSON array."""
-  d1 = _first_digest_with_annotation(client)
-  d2 = _first_digest_without_annotation(client)
-  r = _run_cli("digest", f"{d1.id},{d2.id}", "-o", str(tmp_path), "--no-ocr")
+def test_32_cli_digest_json_no_dir_image_null(client: Client, tmp_path: Path):
+  """--json without --dir: handwritten_image is null (no files persisted)."""
+  d = _first_digest_with_annotation(client)
+  r = _run_cli("digest", d.id, "--no-ocr", "--json", cwd=tmp_path)
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
-  assert isinstance(data, list)
-  assert {x["id"] for x in data} == {d1.id, d2.id}
+  assert data["handwritten_image"] is None
+  assert list(tmp_path.iterdir()) == []
 
 
-def test_30_cli_digest_skip_existing(client: Client, tmp_path: Path):
-  """Second invocation should not rewrite the PNG; handwritten_image still points to it."""
+def test_33_cli_digest_multi_id_with_dir_errors(client: Client, tmp_path: Path):
   d = _first_digest_with_annotation(client)
-  r1 = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
-  assert r1.returncode == 0
-  data1 = json.loads(r1.stdout)
-  img_rel = data1["handwritten_image"]
-  paths1 = [img_rel] if isinstance(img_rel, str) else img_rel
-  mtimes = {p: (tmp_path / p).stat().st_mtime_ns for p in paths1}
-
-  r2 = _run_cli("digest", d.id, "-o", str(tmp_path), "--no-ocr")
-  assert r2.returncode == 0
-  data2 = json.loads(r2.stdout)
-  assert data2["handwritten_image"] == img_rel
-  for p, mt in mtimes.items():
-    assert (tmp_path / p).stat().st_mtime_ns == mt, f"{p} was re-written without --force"
-
-
-def test_31_render_handwriting_file_path(client: Client, tmp_path: Path):
-  """API-level: `out` ending in .png should still work for programmatic users."""
-  d = _first_digest_with_annotation(client)
-  target = tmp_path / "my_annotation.png"
-  paths = api.render_handwriting(client, d, target)
-  assert paths == [target] or (paths and paths[0] == target)
-  assert target.exists()
-  assert target.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+  r = _run_cli("digest", f"{d.id},{d.id}", "--dir", str(tmp_path / "x"), "--no-ocr")
+  assert r.returncode != 0
+  assert "single" in r.stderr.lower() or "per-digest" in r.stderr.lower()
 
 
 # ---------- Sources ----------
@@ -552,20 +555,68 @@ def test_44_cli_note_ls_json(client):
     assert entry["file_name"].endswith(".note")
 
 
-def test_45_cli_note_by_id_json(client, tmp_path):
-  """`note <id>` emits JSON array with v0.2 schema; PNGs under {-o}/attachments/."""
+def test_45_cli_note_markdown_default(client, tmp_path):
+  """Default (no --json, no --dir): markdown to stdout, nothing on disk."""
   file_id = _smallest_cloud_note_id(client)
-  out = tmp_path / "cli_cloud_ocr"
-  r = _run_cli("note", file_id, "-o", str(out), "--no-ocr")
+  r = _run_cli("note", file_id, "--no-ocr", cwd=tmp_path)
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  assert "## Page 1" in r.stdout
+  assert list(tmp_path.iterdir()) == []
+
+
+def test_45a_cli_note_dir_writes_content_and_pages(client, tmp_path):
+  file_id = _smallest_cloud_note_id(client)
+  out = tmp_path / "n"
+  r = _run_cli("note", file_id, "--no-ocr", "--dir", str(out))
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  assert (out / "content.md").exists()
+  assert (out / "page_1.png").exists()
+  cm = (out / "content.md").read_text()
+  cm_norm = cm if cm.endswith("\n") else cm + "\n"
+  stdout_norm = r.stdout if r.stdout.endswith("\n") else r.stdout + "\n"
+  assert cm_norm == stdout_norm
+
+
+def test_45b_cli_note_dir_cache_hit(client, tmp_path):
+  file_id = _smallest_cloud_note_id(client)
+  out = tmp_path / "n"
+  r1 = _run_cli("note", file_id, "--no-ocr", "--dir", str(out))
+  assert r1.returncode == 0
+  m1 = (out / "page_1.png").stat().st_mtime_ns
+  import time as _time
+
+  _time.sleep(0.01)
+  r2 = _run_cli("note", file_id, "--no-ocr", "--dir", str(out))
+  assert r2.returncode == 0
+  assert r2.stdout == r1.stdout
+  assert (out / "page_1.png").stat().st_mtime_ns == m1
+
+
+def test_45c_cli_note_json_shape(client, tmp_path):
+  """`note <id> --json --dir DIR` emits v0.2 per-page JSON with page_N.png paths."""
+  file_id = _smallest_cloud_note_id(client)
+  out = tmp_path / "n"
+  r = _run_cli("note", file_id, "--no-ocr", "--dir", str(out), "--json")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert isinstance(data, list)
   assert len(data) >= 1
   for entry in data:
     assert set(entry) == {"page", "transcript", "annotation", "handwritten_image"}
-    assert entry["annotation"] is None, "--no-ocr must null out annotation"
-    assert entry["handwritten_image"].startswith("attachments/")
+    assert entry["annotation"] is None
+    assert entry["handwritten_image"] == f"page_{entry['page']}.png"
     assert (out / entry["handwritten_image"]).exists()
+
+
+def test_45d_cli_note_json_no_dir_image_null(client, tmp_path):
+  """--json without --dir: handwritten_image is null (no persistence)."""
+  file_id = _smallest_cloud_note_id(client)
+  r = _run_cli("note", file_id, "--no-ocr", "--json", cwd=tmp_path)
+  assert r.returncode == 0, f"stderr: {r.stderr}"
+  data = json.loads(r.stdout)
+  for entry in data:
+    assert entry["handwritten_image"] is None
+  assert list(tmp_path.iterdir()) == []
 
 
 # ---------- Upload round-trip (self-cleaning) ----------

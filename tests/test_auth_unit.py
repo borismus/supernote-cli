@@ -276,3 +276,96 @@ def test_image_to_base64_jpeg_returns_nonempty_str():
   import base64 as _b64
 
   assert _b64.b64decode(s)[:3] == b"\xff\xd8\xff"
+
+
+# ---- Markdown composers/parsers (digest + note) ----
+
+
+def test_compose_digest_markdown_with_ocr():
+  md = api._compose_digest_markdown("Some highlight.", "My scribbled note.")
+  assert md == "> Some highlight.\n\nMy scribbled note.\n"
+
+
+def test_compose_digest_markdown_no_ocr():
+  md = api._compose_digest_markdown("Some highlight.", "")
+  assert md == "> Some highlight.\n"
+
+
+def test_compose_digest_markdown_multiline_highlight():
+  md = api._compose_digest_markdown("Line one\nLine two", "")
+  assert md == "> Line one\n> Line two\n"
+
+
+def test_compose_note_markdown_concatenates_pages():
+  from supernote_cli.api import NotePage
+
+  pages = [
+    NotePage(index=1, png_path=None, transcript=None, ocr_text="first page text"),
+    NotePage(index=2, png_path=None, transcript=None, ocr_text="second page text"),
+  ]
+  md = api._compose_note_markdown(pages)
+  assert "## Page 1\n\nfirst page text\n" in md
+  assert "## Page 2\n\nsecond page text\n" in md
+  assert md.index("## Page 1") < md.index("## Page 2")
+
+
+def test_compose_note_markdown_empty_ocr_renders_blank_section():
+  from supernote_cli.api import NotePage
+
+  pages = [NotePage(index=1, png_path=None, transcript=None, ocr_text=None)]
+  md = api._compose_note_markdown(pages)
+  assert md == "## Page 1\n\n\n"
+
+
+def test_parse_digest_markdown_with_ocr():
+  md = "> Some highlight.\n\nMy scribbled note.\n"
+  highlight, ocr_body = api._parse_digest_markdown(md)
+  assert highlight == "Some highlight."
+  assert ocr_body == "My scribbled note."
+
+
+def test_parse_digest_markdown_no_ocr():
+  md = "> Some highlight.\n"
+  highlight, ocr_body = api._parse_digest_markdown(md)
+  assert highlight == "Some highlight."
+  assert ocr_body is None
+
+
+def test_parse_digest_markdown_multiline_highlight():
+  md = "> Line one\n> Line two\n"
+  highlight, ocr_body = api._parse_digest_markdown(md)
+  assert highlight == "Line one\nLine two"
+  assert ocr_body is None
+
+
+def test_parse_digest_markdown_roundtrip():
+  for hi, ocr_body in [
+    ("simple", "ocr text"),
+    ("multi\nline\nhighlight", "annotation"),
+    ("with no ocr", ""),
+  ]:
+    md = api._compose_digest_markdown(hi, ocr_body)
+    parsed_hi, parsed_ocr = api._parse_digest_markdown(md)
+    assert parsed_hi == hi
+    assert (parsed_ocr or "") == ocr_body
+
+
+def test_parse_note_markdown_extracts_per_page():
+  md = "## Page 1\n\nfirst page text\n\n## Page 2\n\nsecond page text\n"
+  pairs = api._parse_note_markdown(md)
+  assert pairs == [(1, "first page text"), (2, "second page text")]
+
+
+def test_parse_note_markdown_roundtrip():
+  from supernote_cli.api import NotePage
+
+  pages = [
+    NotePage(index=1, png_path=None, transcript=None, ocr_text="page 1\ntwo lines"),
+    NotePage(index=2, png_path=None, transcript=None, ocr_text="page 2"),
+    NotePage(index=3, png_path=None, transcript=None, ocr_text=""),
+  ]
+  md = api._compose_note_markdown(pages)
+  parsed = dict(api._parse_note_markdown(md))
+  assert parsed[1] == "page 1\ntwo lines"
+  assert parsed[2] == "page 2"
+  assert parsed[3] == ""
