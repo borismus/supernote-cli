@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import os
 import random
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -14,6 +16,22 @@ from pathlib import Path, PurePosixPath
 from . import ocr as _ocr
 from .client import ApiError, Client
 from .models import Digest, DigestHash, Note
+
+
+@contextlib.contextmanager
+def _workdir(dir: str | os.PathLike | None):
+  """Yield a Path that is either a TemporaryDirectory or the given dir.
+
+  When dir is None, a tempdir is created and cleaned up on exit. Otherwise
+  the given dir is created if needed and left in place.
+  """
+  if dir is None:
+    with tempfile.TemporaryDirectory() as td:
+      yield Path(td)
+  else:
+    p = Path(dir)
+    p.mkdir(parents=True, exist_ok=True)
+    yield p
 
 
 def list_files(client: Client, directory_id: str | int = 0, page_size: int = 500) -> list[Note]:
@@ -403,35 +421,29 @@ def fetch_handwriting_url(client: Client, digest_id: str | int) -> str | None:
 def render_handwriting(
   client: Client,
   digest: Digest,
-  out: str | os.PathLike = ".",
+  dir: str | os.PathLike,
   *,
   force: bool = False,
 ) -> list[Path]:
-  """Fetch the per-highlight handwriting for a digest and render each page to PNG.
+  """Render a digest's handwriting to `page_N.png` (1-indexed) inside `dir`.
 
-  `out` may be either:
-    - a directory (default) — files are named `{digest_id}.png`, or
-      `{digest_id}_p{N}.png` (1-indexed) for multi-page
-    - a `.png` file path — used directly for single-page handwriting;
-      for multi-page, siblings `{stem}_p{N}.png` are written next to it
+  Returns the full list of page PNG paths (one per rendered page), whether
+  newly written or already on disk. Empty list if the digest has no
+  handwriting (`has_annotation` is False).
 
-  Returns the list of written PNG paths. Empty list if:
-    - the digest has no commentHandwriteName (highlight with no annotation), or
-    - every target PNG already exists and force is False.
-
-  Existing files are skipped unless `force=True`.
+  Skips pages whose PNG already exists unless `force=True`.
   """
   from supernotelib import load_notebook
   from supernotelib.converter import ImageConverter
 
-  if not (digest.raw.get("commentHandwriteName") or ""):
+  if not digest.has_annotation:
     return []
   url = fetch_handwriting_url(client, digest.id)
   if not url:
     return []
 
-  out_path = Path(out)
-  as_file = out_path.suffix.lower() == ".png"
+  out = Path(dir)
+  out.mkdir(parents=True, exist_ok=True)
   mark_bytes = client.get_binary(url)
 
   with tempfile.NamedTemporaryFile(suffix=".mark") as tmp:
@@ -441,25 +453,17 @@ def render_handwriting(
     total = notebook.get_total_pages()
     converter = ImageConverter(notebook, palette=None)
 
-    written: list[Path] = []
+    paths: list[Path] = []
     for i in range(total):
-      if as_file:
-        if total == 1:
-          dest = out_path
-        else:
-          dest = out_path.with_name(f"{out_path.stem}_p{i + 1}{out_path.suffix}")
-      else:
-        suffix = "" if total == 1 else f"_p{i + 1}"
-        dest = out_path / f"{digest.id}{suffix}.png"
-      dest.parent.mkdir(parents=True, exist_ok=True)
+      dest = out / f"page_{i + 1}.png"
+      paths.append(dest)
       if dest.exists() and not force:
         continue
       img = converter.convert(i)
       if img is None:
         continue
       img.save(dest)
-      written.append(dest)
-    return written
+    return paths
 
 
 @dataclass
@@ -598,3 +602,161 @@ def list_notes(
     if n.file_name.endswith(".note"):
       out.append((folder_path, n))
   return out
+
+
+# ---- Markdown helpers (digest + note) ----
+
+
+def _compose_digest_markdown(highlight: str, ocr_body: str) -> str:
+  """Build digest markdown: blockquoted highlight + optional OCR body."""
+  if highlight:
+    quoted = "\n".join(f"> {line}" for line in highlight.splitlines())
+  else:
+    quoted = "> "
+  if ocr_body:
+    return f"{quoted}\n\n{ocr_body.rstrip()}\n"
+  return f"{quoted}\n"
+
+
+def _compose_note_markdown(pages: list[NotePage]) -> str:
+  """Build note markdown: one ## Page N section per page."""
+  sections = []
+  for p in pages:
+    text = (p.ocr_text or "").rstrip()
+    sections.append(f"## Page {p.index}\n\n{text}\n")
+  return "\n".join(sections) if sections else ""
+
+
+_NOTE_PAGE_HEADER_RE = re.compile(r"^## Page (\d+)\s*$", re.MULTILINE)
+
+
+def _parse_digest_markdown(md: str) -> tuple[str, str | None]:
+  """Inverse of _compose_digest_markdown.
+
+  Returns (highlight, ocr_text_or_None). The highlight is the joined
+  content of leading `> `-prefixed lines (newlines preserved); the OCR
+  body is everything after the first blank line that follows the
+  blockquote, stripped. Returns ocr=None when no body is present.
+  """
+  lines = md.splitlines()
+  quote_lines: list[str] = []
+  i = 0
+  while i < len(lines) and lines[i].startswith(">"):
+    quote_lines.append(lines[i][1:].lstrip(" "))
+    i += 1
+  highlight = "\n".join(quote_lines)
+  # Skip blank separator lines.
+  while i < len(lines) and lines[i].strip() == "":
+    i += 1
+  body = "\n".join(lines[i:]).strip()
+  return highlight, (body or None)
+
+
+def _parse_note_markdown(md: str) -> list[tuple[int, str]]:
+  """Inverse of _compose_note_markdown.
+
+  Returns [(page_number, ocr_text), ...] in order of appearance.
+  """
+  matches = list(_NOTE_PAGE_HEADER_RE.finditer(md))
+  out: list[tuple[int, str]] = []
+  for idx, m in enumerate(matches):
+    page = int(m.group(1))
+    body_start = m.end()
+    body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(md)
+    body = md[body_start:body_end].strip("\n")
+    # Drop the single blank separator after the header.
+    if body.startswith("\n"):
+      body = body[1:]
+    out.append((page, body.rstrip()))
+  return out
+
+
+def render_digest_markdown(
+  client: Client,
+  digest: Digest,
+  *,
+  ocr_model: str = _ocr.DEFAULT_MODEL,
+  no_ocr: bool = False,
+  force: bool = False,
+  dir: str | os.PathLike | None = None,
+) -> str:
+  """Build the stdout-equivalent markdown for a digest.
+
+  Format: blockquoted highlight + (when handwriting exists and `no_ocr` is
+  False) the OCR text below, separated by a blank line.
+
+  When `dir` is given, `page_N.png` and `content.md` are persisted there;
+  on re-run, a cached `content.md` is returned unless `force=True`. When
+  `dir` is None, work happens in a tempdir that's discarded.
+  """
+  if dir is not None and not force:
+    cached = Path(dir) / "content.md"
+    if cached.exists():
+      return cached.read_text()
+
+  ocr_body = ""
+  # Render PNGs whenever there's handwriting AND either --dir wants
+  # persistence or we'll OCR them. Skip work entirely if neither applies.
+  if digest.has_annotation and (dir is not None or not no_ocr):
+    with _workdir(dir) as work:
+      pages = render_handwriting(client, digest, work, force=force)
+      if not no_ocr:
+        parts = [_ocr.ocr_image(p, model=ocr_model) or "" for p in pages]
+        ocr_body = "\n\n".join(part for part in parts if part)
+
+  md = _compose_digest_markdown(digest.content or "", ocr_body)
+
+  if dir is not None:
+    out = Path(dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "content.md").write_text(md)
+  return md
+
+
+def render_note_markdown(
+  client: Client,
+  file_id: str | int,
+  *,
+  ocr_model: str = _ocr.DEFAULT_MODEL,
+  no_ocr: bool = False,
+  force: bool = False,
+  dir: str | os.PathLike | None = None,
+) -> str:
+  """Build the stdout-equivalent markdown for a cloud `.note` file.
+
+  Format: `## Page N\\n\\n{ocr text}\\n` per page, concatenated.
+
+  When `dir` is given, `page_N.png` + `content.md` are persisted there;
+  on re-run, the cached `content.md` is returned unless `force=True`.
+  """
+  if dir is not None and not force:
+    cached = Path(dir) / "content.md"
+    if cached.exists():
+      return cached.read_text()
+
+  with _workdir(dir) as work:
+    if no_ocr:
+      # Render PNGs only (no OCR call); build NotePage list with empty ocr_text.
+      with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
+        download_file(client, file_id, Path(tmp.name))
+        png_paths = render_note(tmp.name, work, force=force)
+        transcripts = extract_note_text(tmp.name)
+      pages = [
+        NotePage(
+          index=i + 1,
+          png_path=png,
+          transcript=(transcripts[i] if i < len(transcripts) else "") or None,
+          ocr_text=None,
+        )
+        for i, png in enumerate(png_paths)
+      ]
+    else:
+      pages = ocr_note_from_cloud(client, file_id, work, model=ocr_model, force=force)
+
+  md = _compose_note_markdown(pages)
+
+  if dir is not None:
+    out = Path(dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "content.md").write_text(md)
+  return md
