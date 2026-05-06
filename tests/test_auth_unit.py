@@ -369,3 +369,33 @@ def test_parse_note_markdown_roundtrip():
   assert parsed[1] == "page 1\ntwo lines"
   assert parsed[2] == "page 2"
   assert parsed[3] == ""
+
+
+# ---- OCR prompt composition ----
+
+
+def test_build_prompt_no_extra_returns_default():
+  from supernote_cli.ocr import OCR_PROMPT, _build_prompt
+
+  assert _build_prompt(None) == OCR_PROMPT
+  assert _build_prompt("") == OCR_PROMPT
+  assert _build_prompt("   ") == OCR_PROMPT
+
+
+def test_build_prompt_appends_extra_under_header():
+  from supernote_cli.ocr import OCR_PROMPT, _build_prompt
+
+  extra = "transcribe lines starting with → verbatim"
+  out = _build_prompt(extra)
+  assert out.startswith(OCR_PROMPT)
+  assert "Additional instructions:" in out
+  assert extra in out
+  # Header is on its own line and extra immediately follows
+  assert out.endswith(f"Additional instructions:\n{extra}")
+
+
+def test_build_prompt_strips_surrounding_whitespace():
+  from supernote_cli.ocr import _build_prompt
+
+  out = _build_prompt("\n\nhello\n\n  ")
+  assert out.endswith("Additional instructions:\nhello")

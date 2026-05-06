@@ -95,6 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
   dg.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="(id form) skip Ollama OCR of the handwritten annotation")
   dg.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
   dg.add_argument("--force", action="store_true", help="(id form) ignore cached content.md and re-render/re-OCR")
+  dg.add_argument("--prompt", dest="prompt", help="(id form) extra OCR instructions appended to the default prompt")
 
   nt = sub.add_parser(
     "note",
@@ -127,6 +128,7 @@ def _build_parser() -> argparse.ArgumentParser:
   nt.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="(id form) skip Ollama OCR on each page")
   nt.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
   nt.add_argument("--force", action="store_true", help="(id form) ignore cached content.md and re-render/re-OCR")
+  nt.add_argument("--prompt", dest="prompt", help="(id form) extra OCR instructions appended to the default prompt")
 
   return p
 
@@ -356,6 +358,7 @@ def _digest_show(args) -> int:
     return 0
 
   # Markdown path.
+  extra_prompt = args.prompt
   for i, did in enumerate(ids):
     d = by_id.get(did)
     if d is None:
@@ -367,6 +370,7 @@ def _digest_show(args) -> int:
       no_ocr=args.no_ocr,
       force=args.force,
       dir=args.dir,
+      extra_prompt=extra_prompt,
     )
     if i > 0:
       sys.stdout.write("\n")
@@ -386,6 +390,7 @@ def _digest_json_record(c, digest, args) -> dict:
     no_ocr=args.no_ocr,
     force=args.force,
     dir=args.dir,
+    extra_prompt=args.prompt,
   )
   _, annotation = api._parse_digest_markdown(md)
 
@@ -469,6 +474,7 @@ def _note_show(args) -> int:
     no_ocr=args.no_ocr,
     force=args.force,
     dir=args.dir,
+    extra_prompt=args.prompt,
   )
   sys.stdout.write(md)
   if not md.endswith("\n"):
@@ -487,6 +493,7 @@ def _note_json_record(c, file_id, args) -> list[dict]:
   paths, which the markdown helper doesn't expose. Fall back to the
   underlying ocr_note_from_cloud, but skip OCR if --no-ocr.
   """
+  extra_prompt = args.prompt
   if args.dir is not None:
     md = api.render_note_markdown(
       c, file_id,
@@ -494,6 +501,7 @@ def _note_json_record(c, file_id, args) -> list[dict]:
       no_ocr=args.no_ocr,
       force=args.force,
       dir=args.dir,
+      extra_prompt=extra_prompt,
     )
     page_ocr = dict(api._parse_note_markdown(md))
     # Device transcripts aren't cached on disk; re-fetch via supernotelib by
@@ -531,7 +539,8 @@ def _note_json_record(c, file_id, args) -> list[dict]:
       ]
     else:
       pages = api.ocr_note_from_cloud(
-        c, file_id, workdir, model=args.model, force=args.force
+        c, file_id, workdir,
+        model=args.model, force=args.force, extra_prompt=extra_prompt,
       )
   return [
     {

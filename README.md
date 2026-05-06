@@ -47,11 +47,11 @@ supernote source ls [--days-ago N] [--limit N] [--json]
 
 supernote digest ls [--limit N] [--days-ago N] [--json]
 supernote digest <id>[,<id>...] \                     # markdown to stdout (--json for v0.2 JSON)
-         [--dir DIR] [--no-ocr] [--model M] [--force] [--json]
+         [--dir DIR] [--no-ocr] [--model M] [--force] [--json] [--prompt TEXT]
 
 supernote note ls [--days-ago N] [--limit N] [--json]
 supernote note <file-id> \                            # markdown to stdout (--json for v0.2 JSON)
-         [--dir DIR] [--no-ocr] [--model M] [--force] [--json]
+         [--dir DIR] [--no-ocr] [--model M] [--force] [--json] [--prompt TEXT]
 ```
 
 Global flags: `--no-cache`, `--verbose`, `--equipment-no`.
@@ -124,6 +124,16 @@ Pass `--dir DIR` to also persist `page_N.png` + `content.md` and enable cache-on
 ```
 
 Without `--dir`, `handwritten_image` is `null`.
+
+### Custom OCR prompt
+
+Both `digest <id>` and `note <id>` accept `--prompt TEXT` to layer project-specific transcription rules on top of the default OCR prompt. Useful for preserving inline markers verbatim:
+
+```
+$ supernote note <id> --prompt "When a line begins with → or ☐, transcribe it verbatim including the leading symbol; preserve multi-line continuation."
+```
+
+The text is appended under an `Additional instructions:` section after the default OCR prompt. **The `--dir` cache key is `content.md` alone — it does not track the prompt.** If you change the prompt and want fresh output, pass `--force` to invalidate.
 
 ### Ollama
 

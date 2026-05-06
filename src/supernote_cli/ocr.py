@@ -75,17 +75,34 @@ def image_to_base64_jpeg(image: Image.Image, quality: int = 85) -> str:
   return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+def _build_prompt(extra_prompt: str | None) -> str:
+  """Combine the default OCR prompt with optional caller-supplied instructions.
+
+  Caller text is appended after a clear section header so the model can
+  treat it as additional rules layered on top of the OCR-engine guardrails.
+  """
+  if not extra_prompt:
+    return OCR_PROMPT
+  extra = extra_prompt.strip()
+  if not extra:
+    return OCR_PROMPT
+  return f"{OCR_PROMPT}\n\nAdditional instructions:\n{extra}"
+
+
 def ocr_base64(
   image_base64: str,
   *,
   model: str = DEFAULT_MODEL,
   host: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
+  extra_prompt: str | None = None,
 ) -> str:
   """POST an already-base64-JPEG image to Ollama's chat endpoint.
 
   Returns the transcription string. Raises `OcrError` on transport error,
-  HTTP error, or unexpected response shape.
+  HTTP error, or unexpected response shape. `extra_prompt`, if provided,
+  is appended to the default OCR prompt under an "Additional instructions:"
+  section — useful for project-specific transcription rules.
   """
   h = host or default_host()
   try:
@@ -96,7 +113,7 @@ def ocr_base64(
         "messages": [
           {
             "role": "user",
-            "content": OCR_PROMPT,
+            "content": _build_prompt(extra_prompt),
             "images": [image_base64],
           }
         ],
@@ -134,10 +151,13 @@ def ocr_image(
   max_size: int = DEFAULT_MAX_SIZE,
   host: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
+  extra_prompt: str | None = None,
 ) -> str:
   """Run OCR on an image path or PIL Image via local Ollama vision.
 
-  Raises `OcrError` on any failure.
+  Raises `OcrError` on any failure. `extra_prompt` is appended to the
+  default OCR prompt — used for project-specific transcription rules
+  (e.g. "preserve lines starting with → or ☐ verbatim").
   """
   if isinstance(image, (str, Path)):
     img = Image.open(image)
@@ -145,4 +165,6 @@ def ocr_image(
     img = image
   img = resize_for_ocr(img, max_size=max_size)
   payload = image_to_base64_jpeg(img)
-  return ocr_base64(payload, model=model, host=host, timeout=timeout)
+  return ocr_base64(
+    payload, model=model, host=host, timeout=timeout, extra_prompt=extra_prompt
+  )

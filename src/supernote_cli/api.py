@@ -531,12 +531,14 @@ def ocr_note(
   *,
   model: str = _ocr.DEFAULT_MODEL,
   force: bool = False,
+  extra_prompt: str | None = None,
 ) -> list[NotePage]:
   """Render a `.note` file's pages, pull device transcripts, OCR each page.
 
   Bundles `render_note` + `extract_note_text` + `ocr_image` into one call.
   If Ollama is unreachable, `ocr_text` is None on every page but the rest
-  of the record is still populated.
+  of the record is still populated. `extra_prompt` is forwarded to
+  `ocr_image` for project-specific transcription rules.
   """
   png_paths = render_note(note_path, out_dir, force=force)
   transcripts = extract_note_text(note_path)
@@ -547,7 +549,7 @@ def ocr_note(
     ocr_text: str | None = None
     if png.exists():
       try:
-        ocr_text = _ocr.ocr_image(png, model=model)
+        ocr_text = _ocr.ocr_image(png, model=model, extra_prompt=extra_prompt)
       except _ocr.OcrError:
         ocr_text = None
     pages.append(
@@ -568,15 +570,18 @@ def ocr_note_from_cloud(
   *,
   model: str = _ocr.DEFAULT_MODEL,
   force: bool = False,
+  extra_prompt: str | None = None,
 ) -> list[NotePage]:
   """Download a cloud `.note` by id to a temp file, then run `ocr_note`.
 
   PNG outputs persist under `out_dir`; the downloaded `.note` is discarded
-  after rendering.
+  after rendering. `extra_prompt` is forwarded to `ocr_note`.
   """
   with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
     download_file(client, file_id, Path(tmp.name))
-    return ocr_note(tmp.name, out_dir, model=model, force=force)
+    return ocr_note(
+      tmp.name, out_dir, model=model, force=force, extra_prompt=extra_prompt
+    )
 
 
 def list_notes(
@@ -679,6 +684,7 @@ def render_digest_markdown(
   no_ocr: bool = False,
   force: bool = False,
   dir: str | os.PathLike | None = None,
+  extra_prompt: str | None = None,
 ) -> str:
   """Build the stdout-equivalent markdown for a digest.
 
@@ -688,6 +694,9 @@ def render_digest_markdown(
   When `dir` is given, `page_N.png` and `content.md` are persisted there;
   on re-run, a cached `content.md` is returned unless `force=True`. When
   `dir` is None, work happens in a tempdir that's discarded.
+
+  The cache key is content.md alone — it does not track `extra_prompt`.
+  Pass `force=True` if you change the prompt and want to invalidate.
   """
   if dir is not None and not force:
     cached = Path(dir) / "content.md"
@@ -701,7 +710,10 @@ def render_digest_markdown(
     with _workdir(dir) as work:
       pages = render_handwriting(client, digest, work, force=force)
       if not no_ocr:
-        parts = [_ocr.ocr_image(p, model=ocr_model) or "" for p in pages]
+        parts = [
+          _ocr.ocr_image(p, model=ocr_model, extra_prompt=extra_prompt) or ""
+          for p in pages
+        ]
         ocr_body = "\n\n".join(part for part in parts if part)
 
   md = _compose_digest_markdown(digest.content or "", ocr_body)
@@ -721,6 +733,7 @@ def render_note_markdown(
   no_ocr: bool = False,
   force: bool = False,
   dir: str | os.PathLike | None = None,
+  extra_prompt: str | None = None,
 ) -> str:
   """Build the stdout-equivalent markdown for a cloud `.note` file.
 
@@ -728,6 +741,8 @@ def render_note_markdown(
 
   When `dir` is given, `page_N.png` + `content.md` are persisted there;
   on re-run, the cached `content.md` is returned unless `force=True`.
+  The cache does not track `extra_prompt` — pass `force=True` to
+  re-OCR with a changed prompt.
   """
   if dir is not None and not force:
     cached = Path(dir) / "content.md"
@@ -751,7 +766,10 @@ def render_note_markdown(
         for i, png in enumerate(png_paths)
       ]
     else:
-      pages = ocr_note_from_cloud(client, file_id, work, model=ocr_model, force=force)
+      pages = ocr_note_from_cloud(
+        client, file_id, work,
+        model=ocr_model, force=force, extra_prompt=extra_prompt,
+      )
 
   md = _compose_note_markdown(pages)
 
