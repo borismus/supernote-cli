@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import shutil
 import sys
 import tempfile
 import threading
@@ -16,23 +17,29 @@ from .client import ApiError, AuthRequired, Client
 
 
 class _Marquee:
-  """Single-line `\\r`-overwriting OCR progress indicator on stderr.
+  """Two-line OCR progress display on stderr:
 
-  Maintains a rolling tail of recent token text. A daemon thread re-renders
-  every 200ms: `thinking [Ns] {last 40 chars}`. When stderr is not a TTY
-  (piped/redirected), falls back to plain per-page header lines and drops
-  the marquee — `\\r` would look terrible in a log file.
+      Transcribing {spinner} Page N/M
+      Thinking: {marquee tail filling the rest of the terminal width}
 
-  Use as two callbacks:
+  A daemon thread re-renders every TICK_SECONDS so the spinner animates
+  even when no tokens are arriving. Lines are redrawn in place via ANSI
+  cursor-up + clear, so the actual OCR output written to stdout after
+  `close()` lands on a clean line.
+
+  When stderr is not a TTY (piped/redirected) we drop ANSI control codes
+  entirely and emit one `[page N/M] OCR...` log line per page boundary.
+
+  Callbacks the api layer fires:
     `marquee.page(index, total)` — called once per page before OCR starts.
     `marquee.token(delta)` — called per Ollama streaming chunk.
 
-  Always call `marquee.close()` at the end to stop the thread and clear
-  the line.
+  Always call `marquee.close()` to stop the thread and clear both lines.
   """
 
-  TAIL = 40
-  TICK_SECONDS = 0.2
+  SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  TICK_SECONDS = 0.1
+  THINKING_PREFIX = "Thinking: "
 
   def __init__(self):
     self._tty = sys.stderr.isatty()
@@ -42,14 +49,14 @@ class _Marquee:
     self._thread: threading.Thread | None = None
     self._page_idx = 0
     self._page_total = 0
-    self._page_start_ts = 0.0
-    self._line_max = 0  # widest line written; used to fully blank on rerender
+    self._spin_i = 0
+    self._drawn = False  # are line1+line2 currently on screen?
 
   def page(self, idx: int, total: int) -> None:
-    self._end_active_line()
+    if self._tty:
+      self._clear_lines()
     self._page_idx = idx
     self._page_total = total
-    self._page_start_ts = time.time()
     with self._lock:
       self._buf = ""
     if not self._tty:
@@ -72,7 +79,8 @@ class _Marquee:
     if self._thread is not None:
       self._thread.join(timeout=0.5)
       self._thread = None
-    self._end_active_line()
+    if self._tty:
+      self._clear_lines()
 
   # internals
 
@@ -80,27 +88,39 @@ class _Marquee:
     while not self._stop.wait(self.TICK_SECONDS):
       self._render()
 
+  def _term_cols(self) -> int:
+    return max(20, shutil.get_terminal_size((80, 20)).columns)
+
   def _render(self) -> None:
     if not self._tty or self._page_idx == 0:
       return
-    elapsed = int(time.time() - self._page_start_ts)
+    cols = self._term_cols()
+    spin = self.SPINNER[self._spin_i % len(self.SPINNER)]
+    self._spin_i += 1
+    line1 = f"Transcribing {spin} Page {self._page_idx}/{self._page_total}"
+    width = max(1, cols - len(self.THINKING_PREFIX))
     with self._lock:
-      tail = self._buf[-self.TAIL :].replace("\n", " ").replace("\r", " ")
-    label = f"[page {self._page_idx}/{self._page_total}] thinking [{elapsed}s]"
-    line = f"{label} {tail}".rstrip()
-    self._line_max = max(self._line_max, len(line))
-    pad = " " * max(0, self._line_max - len(line))
-    sys.stderr.write(f"\r{line}{pad}")
+      tail = self._buf.replace("\n", " ").replace("\r", " ")[-width:]
+    line2 = f"{self.THINKING_PREFIX}{tail}"
+    line1 = line1[:cols].ljust(cols)
+    line2 = line2[:cols].ljust(cols)
+    if self._drawn:
+      # Move cursor to start of line1, clear, write, then line2.
+      out = f"\r\x1b[1A\x1b[2K{line1}\n\x1b[2K{line2}"
+    else:
+      out = f"{line1}\n{line2}"
+      self._drawn = True
+    sys.stderr.write(out)
     sys.stderr.flush()
 
-  def _end_active_line(self) -> None:
-    """Clear the marquee line and leave stderr at column 0 of a new line."""
-    if not self._tty or self._page_idx == 0:
+  def _clear_lines(self) -> None:
+    """Erase the two rendered lines and leave the cursor at the start of
+    the (now-blank) first line, so subsequent stdout output starts there."""
+    if not self._drawn:
       return
-    if self._line_max > 0:
-      sys.stderr.write("\r" + " " * self._line_max + "\r")
-      sys.stderr.flush()
-    self._line_max = 0
+    sys.stderr.write("\r\x1b[2K\x1b[1A\x1b[2K")
+    sys.stderr.flush()
+    self._drawn = False
 
 
 def _build_parser() -> argparse.ArgumentParser:

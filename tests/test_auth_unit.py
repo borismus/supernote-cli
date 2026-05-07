@@ -519,16 +519,19 @@ def test_marquee_non_tty_falls_back_to_plain_lines(monkeypatch, capsys):
   assert "\r" not in err
 
 
-def test_marquee_tty_uses_carriage_return_overwrite(monkeypatch, capsys):
-  """When stderr IS a TTY, marquee writes \\r-prefixed status lines so the
-  display stays on a single line."""
+def test_marquee_tty_renders_two_lines_with_spinner_and_thinking(monkeypatch, capsys):
+  """When stderr IS a TTY, marquee draws a two-line status: a
+  `Transcribing {spinner} Page N/M` line and a `Thinking: {tail}` line,
+  using ANSI cursor controls so subsequent renders update in place."""
   from supernote_cli.cli import _Marquee
 
   monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+  monkeypatch.setattr(
+    "shutil.get_terminal_size", lambda fallback=(80, 20): type("S", (), {"columns": 80, "lines": 20})()
+  )
   m = _Marquee()
   try:
-    m.page(1, 1)
-    # Force at least one render synchronously so capsys can see it
+    m.page(1, 3)
     m._render()
     m.token("ABC")
     m._render()
@@ -536,28 +539,40 @@ def test_marquee_tty_uses_carriage_return_overwrite(monkeypatch, capsys):
     m.close()
 
   err = capsys.readouterr().err
-  assert "\r" in err
-  assert "[page 1/1]" in err
-  assert "thinking" in err
+  assert "Transcribing" in err
+  assert "Page 1/3" in err
+  assert "Thinking:" in err
+  # ANSI cursor-up used to overwrite line 1 on rerender
+  assert "\x1b[1A" in err
+  # Spinner glyph from the configured set is present
+  assert any(g in err for g in _Marquee.SPINNER)
 
 
-def test_marquee_tail_window_is_bounded():
-  """Tail buffer should only show the last 40 chars."""
-  import threading as _threading
-
+def test_marquee_thinking_tail_fits_terminal_width(monkeypatch, capsys):
+  """The `Thinking:` marquee tail is bounded by the terminal width minus
+  the prefix, so it never wraps to a third line."""
   from supernote_cli.cli import _Marquee
 
+  monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+  cols = 60
+  monkeypatch.setattr(
+    "shutil.get_terminal_size",
+    lambda fallback=(80, 20): type("S", (), {"columns": cols, "lines": 20})(),
+  )
   m = _Marquee()
-  # Force tty mode so _render does work
-  m._tty = True
-  m._page_idx = 1
-  m._page_total = 1
-  m._page_start_ts = 0.0
-  m._stop = _threading.Event()
-  long_text = "x" * 200
-  m.token(long_text)
-  # Inspect the buffer's tail directly
-  with m._lock:
-    tail = m._buf[-_Marquee.TAIL :]
-  assert len(tail) == _Marquee.TAIL
-  m.close()
+  try:
+    m.page(1, 1)
+    m.token("x" * 500)
+    m._render()
+  finally:
+    m.close()
+
+  err = capsys.readouterr().err
+  # Pull out the rendered "Thinking:" line — it's followed by the tail
+  # of x's, padded out to cols. The visible x-run must be exactly the
+  # marquee width (cols - len("Thinking: ")).
+  expected_xs = cols - len(_Marquee.THINKING_PREFIX)
+  # The tail should contain a run of exactly `expected_xs` x characters.
+  assert ("x" * expected_xs) in err
+  # And NOT one character more (would mean the tail isn't bounded).
+  assert ("x" * (expected_xs + 1)) not in err
