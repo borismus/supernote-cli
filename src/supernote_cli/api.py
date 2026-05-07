@@ -533,16 +533,20 @@ def ocr_note(
   model: str = _ocr.DEFAULT_MODEL,
   force: bool = False,
   extra_prompt: str | None = None,
-  on_progress: Callable[[str], None] | None = None,
+  on_page_start: Callable[[int, int], None] | None = None,
+  on_token: Callable[[str], None] | None = None,
 ) -> list[NotePage]:
   """Render a `.note` file's pages, pull device transcripts, OCR each page.
 
   Bundles `render_note` + `extract_note_text` + `ocr_image` into one call.
   If Ollama is unreachable, `ocr_text` is None on every page but the rest
   of the record is still populated. `extra_prompt` is forwarded to
-  `ocr_image` for project-specific transcription rules. When
-  `on_progress` is provided, it receives a per-page header line then
-  every streamed token (so callers can echo OCR output as it arrives).
+  `ocr_image` for project-specific transcription rules.
+
+  Two structured progress callbacks (both optional):
+    on_page_start(page_index, total_pages): once per page before OCR.
+    on_token(delta): per Ollama streaming chunk (also includes any
+      thinking text the model emits). Returned string is unaffected.
   """
   png_paths = render_note(note_path, out_dir, force=force)
   transcripts = extract_note_text(note_path)
@@ -550,14 +554,14 @@ def ocr_note(
 
   pages: list[NotePage] = []
   for i, png in enumerate(png_paths):
-    if on_progress:
-      on_progress(f"\n[page {i + 1}/{total}]\n")
+    if on_page_start:
+      on_page_start(i + 1, total)
     transcript = transcripts[i] if i < len(transcripts) else ""
     ocr_text: str | None = None
     if png.exists():
       try:
         ocr_text = _ocr.ocr_image(
-          png, model=model, extra_prompt=extra_prompt, on_token=on_progress
+          png, model=model, extra_prompt=extra_prompt, on_token=on_token
         )
       except _ocr.OcrError:
         ocr_text = None
@@ -580,13 +584,14 @@ def ocr_note_from_cloud(
   model: str = _ocr.DEFAULT_MODEL,
   force: bool = False,
   extra_prompt: str | None = None,
-  on_progress: Callable[[str], None] | None = None,
+  on_page_start: Callable[[int, int], None] | None = None,
+  on_token: Callable[[str], None] | None = None,
 ) -> list[NotePage]:
   """Download a cloud `.note` by id to a temp file, then run `ocr_note`.
 
   PNG outputs persist under `out_dir`; the downloaded `.note` is discarded
-  after rendering. `extra_prompt` and `on_progress` are forwarded to
-  `ocr_note`.
+  after rendering. `extra_prompt`, `on_page_start`, and `on_token` are
+  forwarded to `ocr_note`.
   """
   with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
     download_file(client, file_id, Path(tmp.name))
@@ -596,7 +601,8 @@ def ocr_note_from_cloud(
       model=model,
       force=force,
       extra_prompt=extra_prompt,
-      on_progress=on_progress,
+      on_page_start=on_page_start,
+      on_token=on_token,
     )
 
 
@@ -701,7 +707,8 @@ def render_digest_markdown(
   force: bool = False,
   dir: str | os.PathLike | None = None,
   extra_prompt: str | None = None,
-  on_progress: Callable[[str], None] | None = None,
+  on_page_start: Callable[[int, int], None] | None = None,
+  on_token: Callable[[str], None] | None = None,
 ) -> str:
   """Build the stdout-equivalent markdown for a digest.
 
@@ -715,8 +722,7 @@ def render_digest_markdown(
   The cache key is content.md alone — it does not track `extra_prompt`.
   Pass `force=True` if you change the prompt and want to invalidate.
 
-  When `on_progress` is provided, OCR is streamed: per-page boundary
-  lines and per-token deltas are passed to the callback as they arrive.
+  Progress callbacks (both optional) — same shape as ocr_note.
   """
   if dir is not None and not force:
     cached = Path(dir) / "content.md"
@@ -733,11 +739,11 @@ def render_digest_markdown(
         total = len(pages)
         parts: list[str] = []
         for i, p in enumerate(pages):
-          if on_progress:
-            on_progress(f"\n[page {i + 1}/{total}]\n")
+          if on_page_start:
+            on_page_start(i + 1, total)
           parts.append(
             _ocr.ocr_image(
-              p, model=ocr_model, extra_prompt=extra_prompt, on_token=on_progress
+              p, model=ocr_model, extra_prompt=extra_prompt, on_token=on_token
             )
             or ""
           )
@@ -761,7 +767,8 @@ def render_note_markdown(
   force: bool = False,
   dir: str | os.PathLike | None = None,
   extra_prompt: str | None = None,
-  on_progress: Callable[[str], None] | None = None,
+  on_page_start: Callable[[int, int], None] | None = None,
+  on_token: Callable[[str], None] | None = None,
 ) -> str:
   """Build the stdout-equivalent markdown for a cloud `.note` file.
 
@@ -772,8 +779,7 @@ def render_note_markdown(
   The cache does not track `extra_prompt` — pass `force=True` to
   re-OCR with a changed prompt.
 
-  When `on_progress` is provided, OCR is streamed: per-page boundary
-  lines and per-token deltas are passed to the callback as they arrive.
+  Progress callbacks (both optional) — same shape as ocr_note.
   """
   if dir is not None and not force:
     cached = Path(dir) / "content.md"
@@ -800,7 +806,7 @@ def render_note_markdown(
       pages = ocr_note_from_cloud(
         client, file_id, work,
         model=ocr_model, force=force, extra_prompt=extra_prompt,
-        on_progress=on_progress,
+        on_page_start=on_page_start, on_token=on_token,
       )
 
   md = _compose_note_markdown(pages)

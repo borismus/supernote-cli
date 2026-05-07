@@ -13,7 +13,6 @@ import base64
 import io
 import json
 import os
-import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -156,55 +155,28 @@ def ocr_base64(
 
   # Streaming: each line is a JSON object with a partial message.content.
   # Final chunk has done=true and may include a final aggregated message.
-  #
-  # Liveness: the model can take many seconds before the first token (image
-  # encode + GPU model load on a cold call). To keep the CLI feeling alive,
-  # a background thread emits a dot per second until either the first
-  # content token arrives or the stream finishes. Dots go through `on_token`
-  # but are NOT appended to `parts` — the returned string stays clean.
+  # All chunks (content + thinking) flow through on_token; only `content`
+  # deltas are appended to the returned string. Liveness UX (spinner /
+  # marquee / per-page headers) is the caller's responsibility — keeps
+  # this layer thin and lets the CLI render the way it wants.
   parts: list[str] = []
-  first_seen = False
-  stop = threading.Event()
-
-  def _tick():
-    while not stop.wait(1.0):
-      on_token(".")
-
-  spinner = threading.Thread(target=_tick, daemon=True)
-  spinner.start()
-  try:
-    for raw in response.iter_lines():
-      if not raw:
-        continue
-      try:
-        chunk = json.loads(raw)
-      except ValueError:
-        continue
-      msg = chunk.get("message") or {}
-      thinking = msg.get("thinking") or ""
-      delta = msg.get("content") or chunk.get("response") or ""
-
-      if thinking:
-        # Surface fragmentary reasoning when the model emits it (Ollama
-        # exposes this for thinking-capable models). Prefix once so it's
-        # visually distinct from the final OCR output.
-        if not first_seen:
-          first_seen = True
-          stop.set()
-          on_token("\n")
-        on_token(thinking)
-      if delta:
-        if not first_seen:
-          first_seen = True
-          stop.set()
-          on_token("\n")
-        on_token(delta)
-        parts.append(delta)
-      if chunk.get("done"):
-        break
-  finally:
-    stop.set()
-    spinner.join(timeout=0.1)
+  for raw in response.iter_lines():
+    if not raw:
+      continue
+    try:
+      chunk = json.loads(raw)
+    except ValueError:
+      continue
+    msg = chunk.get("message") or {}
+    thinking = msg.get("thinking") or ""
+    delta = msg.get("content") or chunk.get("response") or ""
+    if thinking:
+      on_token(thinking)
+    if delta:
+      on_token(delta)
+      parts.append(delta)
+    if chunk.get("done"):
+      break
   return "".join(parts).strip()
 
 

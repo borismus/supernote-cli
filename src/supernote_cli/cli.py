@@ -7,11 +7,100 @@ import datetime as dt
 import json
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 from . import api, ocr, tokenstore
 from .client import ApiError, AuthRequired, Client
+
+
+class _Marquee:
+  """Single-line `\\r`-overwriting OCR progress indicator on stderr.
+
+  Maintains a rolling tail of recent token text. A daemon thread re-renders
+  every 200ms: `thinking [Ns] {last 40 chars}`. When stderr is not a TTY
+  (piped/redirected), falls back to plain per-page header lines and drops
+  the marquee — `\\r` would look terrible in a log file.
+
+  Use as two callbacks:
+    `marquee.page(index, total)` — called once per page before OCR starts.
+    `marquee.token(delta)` — called per Ollama streaming chunk.
+
+  Always call `marquee.close()` at the end to stop the thread and clear
+  the line.
+  """
+
+  TAIL = 40
+  TICK_SECONDS = 0.2
+
+  def __init__(self):
+    self._tty = sys.stderr.isatty()
+    self._buf = ""
+    self._lock = threading.Lock()
+    self._stop = threading.Event()
+    self._thread: threading.Thread | None = None
+    self._page_idx = 0
+    self._page_total = 0
+    self._page_start_ts = 0.0
+    self._line_max = 0  # widest line written; used to fully blank on rerender
+
+  def page(self, idx: int, total: int) -> None:
+    self._end_active_line()
+    self._page_idx = idx
+    self._page_total = total
+    self._page_start_ts = time.time()
+    with self._lock:
+      self._buf = ""
+    if not self._tty:
+      sys.stderr.write(f"[page {idx}/{total}] OCR...\n")
+      sys.stderr.flush()
+      return
+    if self._thread is None:
+      self._thread = threading.Thread(target=self._tick, daemon=True)
+      self._thread.start()
+    self._render()
+
+  def token(self, text: str) -> None:
+    if not text:
+      return
+    with self._lock:
+      self._buf += text
+
+  def close(self) -> None:
+    self._stop.set()
+    if self._thread is not None:
+      self._thread.join(timeout=0.5)
+      self._thread = None
+    self._end_active_line()
+
+  # internals
+
+  def _tick(self) -> None:
+    while not self._stop.wait(self.TICK_SECONDS):
+      self._render()
+
+  def _render(self) -> None:
+    if not self._tty or self._page_idx == 0:
+      return
+    elapsed = int(time.time() - self._page_start_ts)
+    with self._lock:
+      tail = self._buf[-self.TAIL :].replace("\n", " ").replace("\r", " ")
+    label = f"[page {self._page_idx}/{self._page_total}] thinking [{elapsed}s]"
+    line = f"{label} {tail}".rstrip()
+    self._line_max = max(self._line_max, len(line))
+    pad = " " * max(0, self._line_max - len(line))
+    sys.stderr.write(f"\r{line}{pad}")
+    sys.stderr.flush()
+
+  def _end_active_line(self) -> None:
+    """Clear the marquee line and leave stderr at column 0 of a new line."""
+    if not self._tty or self._page_idx == 0:
+      return
+    if self._line_max > 0:
+      sys.stderr.write("\r" + " " * self._line_max + "\r")
+      sys.stderr.flush()
+    self._line_max = 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -359,47 +448,51 @@ def _digest_show(args) -> int:
 
   # Markdown path.
   extra_prompt = args.prompt
-  for i, did in enumerate(ids):
-    d = by_id.get(did)
-    if d is None:
-      print(f"warning: digest {did} not found", file=sys.stderr)
-      continue
-    md = api.render_digest_markdown(
-      c, d,
-      ocr_model=args.model,
-      no_ocr=args.no_ocr,
-      force=args.force,
-      dir=args.dir,
-      extra_prompt=extra_prompt,
-      on_progress=_stream_to_stderr,
-    )
-    if i > 0:
-      sys.stdout.write("\n")
-    sys.stdout.write(md)
-    if not md.endswith("\n"):
-      sys.stdout.write("\n")
+  marquee = _Marquee()
+  try:
+    for i, did in enumerate(ids):
+      d = by_id.get(did)
+      if d is None:
+        print(f"warning: digest {did} not found", file=sys.stderr)
+        continue
+      md = api.render_digest_markdown(
+        c, d,
+        ocr_model=args.model,
+        no_ocr=args.no_ocr,
+        force=args.force,
+        dir=args.dir,
+        extra_prompt=extra_prompt,
+        on_page_start=marquee.page,
+        on_token=marquee.token,
+      )
+      if i > 0:
+        sys.stdout.write("\n")
+      sys.stdout.write(md)
+      if not md.endswith("\n"):
+        sys.stdout.write("\n")
+  finally:
+    marquee.close()
   return 0
-
-
-def _stream_to_stderr(text: str) -> None:
-  """Default `on_progress` for OCR streaming: write to stderr, flush each token."""
-  sys.stderr.write(text)
-  sys.stderr.flush()
 
 
 def _digest_json_record(c, digest, args) -> dict:
   """Build a v0.2-shaped JSON record for a digest, leveraging --dir cache."""
   # Always materialize markdown first (handles cache + fresh work uniformly),
   # then parse it back to extract the OCR'd annotation text.
-  md = api.render_digest_markdown(
-    c, digest,
-    ocr_model=args.model,
-    no_ocr=args.no_ocr,
-    force=args.force,
-    dir=args.dir,
-    extra_prompt=args.prompt,
-    on_progress=_stream_to_stderr,
-  )
+  marquee = _Marquee()
+  try:
+    md = api.render_digest_markdown(
+      c, digest,
+      ocr_model=args.model,
+      no_ocr=args.no_ocr,
+      force=args.force,
+      dir=args.dir,
+      extra_prompt=args.prompt,
+      on_page_start=marquee.page,
+      on_token=marquee.token,
+    )
+  finally:
+    marquee.close()
   _, annotation = api._parse_digest_markdown(md)
 
   rec: dict = {
@@ -476,15 +569,20 @@ def _note_show(args) -> int:
     print(json.dumps(rec, indent=2))
     return 0
 
-  md = api.render_note_markdown(
-    c, file_id,
-    ocr_model=args.model,
-    no_ocr=args.no_ocr,
-    force=args.force,
-    dir=args.dir,
-    extra_prompt=args.prompt,
-    on_progress=_stream_to_stderr,
-  )
+  marquee = _Marquee()
+  try:
+    md = api.render_note_markdown(
+      c, file_id,
+      ocr_model=args.model,
+      no_ocr=args.no_ocr,
+      force=args.force,
+      dir=args.dir,
+      extra_prompt=args.prompt,
+      on_page_start=marquee.page,
+      on_token=marquee.token,
+    )
+  finally:
+    marquee.close()
   sys.stdout.write(md)
   if not md.endswith("\n"):
     sys.stdout.write("\n")
@@ -503,16 +601,21 @@ def _note_json_record(c, file_id, args) -> list[dict]:
   underlying ocr_note_from_cloud, but skip OCR if --no-ocr.
   """
   extra_prompt = args.prompt
+  marquee = _Marquee()
   if args.dir is not None:
-    md = api.render_note_markdown(
-      c, file_id,
-      ocr_model=args.model,
-      no_ocr=args.no_ocr,
-      force=args.force,
-      dir=args.dir,
-      extra_prompt=extra_prompt,
-      on_progress=_stream_to_stderr,
-    )
+    try:
+      md = api.render_note_markdown(
+        c, file_id,
+        ocr_model=args.model,
+        no_ocr=args.no_ocr,
+        force=args.force,
+        dir=args.dir,
+        extra_prompt=extra_prompt,
+        on_page_start=marquee.page,
+        on_token=marquee.token,
+      )
+    finally:
+      marquee.close()
     page_ocr = dict(api._parse_note_markdown(md))
     # Device transcripts aren't cached on disk; re-fetch via supernotelib by
     # downloading the .note again. Fast enough for the JSON path.
@@ -548,11 +651,14 @@ def _note_json_record(c, file_id, args) -> list[dict]:
         for i in range(len(transcripts))
       ]
     else:
-      pages = api.ocr_note_from_cloud(
-        c, file_id, workdir,
-        model=args.model, force=args.force, extra_prompt=extra_prompt,
-        on_progress=_stream_to_stderr,
-      )
+      try:
+        pages = api.ocr_note_from_cloud(
+          c, file_id, workdir,
+          model=args.model, force=args.force, extra_prompt=extra_prompt,
+          on_page_start=marquee.page, on_token=marquee.token,
+        )
+      finally:
+        marquee.close()
   return [
     {
       "page": p.index,

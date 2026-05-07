@@ -1,4 +1,5 @@
 import re
+import sys
 from datetime import datetime, timedelta
 
 from PIL import Image
@@ -432,18 +433,40 @@ def test_ocr_base64_streaming_calls_callback_per_chunk(monkeypatch):
   received: list[str] = []
   out = ocr.ocr_base64("abc", on_token=received.append)
 
-  # Return value aggregates only content deltas — spinner dots and the
-  # newline that clears them are passed to on_token but NOT into parts.
+  # ocr_base64 is a thin streaming layer: each Ollama content chunk is
+  # passed through on_token and aggregated into the return string.
   assert out == "Hello world!"
-  # The first content arrival writes a newline (to clear any spinner dots
-  # already on stderr). Background spinner is unlikely to fire in this
-  # sub-second synchronous test, but we tolerate stray '.' tokens too.
-  content_only = [t for t in received if t not in ("\n", ".")]
-  assert content_only == ["Hello", " world", "!"]
-  # And: a clearing newline was emitted before content started.
-  assert "\n" in received
+  assert received == ["Hello", " world", "!"]
   assert captured_payload["stream"] is True
   assert captured_payload["json"]["stream"] is True
+
+
+def test_ocr_base64_streaming_surfaces_thinking(monkeypatch):
+  """Thinking deltas reach on_token but don't appear in the returned string."""
+  from supernote_cli import ocr
+
+  chunks_jsonl = [
+    b'{"message": {"thinking": "I see a checkbox..."}, "done": false}',
+    b'{"message": {"content": "Hello"}, "done": false}',
+    b'{"done": true}',
+  ]
+
+  class FakeResponse:
+    status_code = 200
+
+    def iter_lines(self):
+      yield from chunks_jsonl
+
+  monkeypatch.setattr(
+    ocr.requests, "post", lambda *a, **kw: FakeResponse()
+  )
+
+  received: list[str] = []
+  out = ocr.ocr_base64("abc", on_token=received.append)
+
+  assert out == "Hello"  # thinking is NOT in the return string
+  assert "I see a checkbox..." in received  # ...but it WAS streamed
+  assert "Hello" in received
 
 
 def test_ocr_base64_non_streaming_when_no_callback(monkeypatch):
@@ -469,3 +492,72 @@ def test_ocr_base64_non_streaming_when_no_callback(monkeypatch):
   assert out == "Full text."  # strip()-ed
   assert captured_payload["stream"] is False
   assert captured_payload["json"]["stream"] is False
+
+
+# ---- CLI marquee ----
+
+
+def test_marquee_non_tty_falls_back_to_plain_lines(monkeypatch, capsys):
+  """When stderr is NOT a TTY, marquee writes a plain `[page N/M] OCR...`
+  line per page and skips the \\r-overwriting tick thread."""
+  from supernote_cli.cli import _Marquee
+
+  monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+  m = _Marquee()
+  try:
+    m.page(1, 3)
+    m.token("Hello")
+    m.token(" world")
+    m.page(2, 3)
+  finally:
+    m.close()
+
+  err = capsys.readouterr().err
+  assert "[page 1/3]" in err
+  assert "[page 2/3]" in err
+  # No `\r` overwrites (those would corrupt log files)
+  assert "\r" not in err
+
+
+def test_marquee_tty_uses_carriage_return_overwrite(monkeypatch, capsys):
+  """When stderr IS a TTY, marquee writes \\r-prefixed status lines so the
+  display stays on a single line."""
+  from supernote_cli.cli import _Marquee
+
+  monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+  m = _Marquee()
+  try:
+    m.page(1, 1)
+    # Force at least one render synchronously so capsys can see it
+    m._render()
+    m.token("ABC")
+    m._render()
+  finally:
+    m.close()
+
+  err = capsys.readouterr().err
+  assert "\r" in err
+  assert "[page 1/1]" in err
+  assert "thinking" in err
+
+
+def test_marquee_tail_window_is_bounded():
+  """Tail buffer should only show the last 40 chars."""
+  import threading as _threading
+
+  from supernote_cli.cli import _Marquee
+
+  m = _Marquee()
+  # Force tty mode so _render does work
+  m._tty = True
+  m._page_idx = 1
+  m._page_total = 1
+  m._page_start_ts = 0.0
+  m._stop = _threading.Event()
+  long_text = "x" * 200
+  m.token(long_text)
+  # Inspect the buffer's tail directly
+  with m._lock:
+    tail = m._buf[-_Marquee.TAIL :]
+  assert len(tail) == _Marquee.TAIL
+  m.close()
