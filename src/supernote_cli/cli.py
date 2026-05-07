@@ -371,6 +371,7 @@ def _digest_show(args) -> int:
       force=args.force,
       dir=args.dir,
       extra_prompt=extra_prompt,
+      on_progress=_stream_to_stderr,
     )
     if i > 0:
       sys.stdout.write("\n")
@@ -378,6 +379,12 @@ def _digest_show(args) -> int:
     if not md.endswith("\n"):
       sys.stdout.write("\n")
   return 0
+
+
+def _stream_to_stderr(text: str) -> None:
+  """Default `on_progress` for OCR streaming: write to stderr, flush each token."""
+  sys.stderr.write(text)
+  sys.stderr.flush()
 
 
 def _digest_json_record(c, digest, args) -> dict:
@@ -391,6 +398,7 @@ def _digest_json_record(c, digest, args) -> dict:
     force=args.force,
     dir=args.dir,
     extra_prompt=args.prompt,
+    on_progress=_stream_to_stderr,
   )
   _, annotation = api._parse_digest_markdown(md)
 
@@ -475,6 +483,7 @@ def _note_show(args) -> int:
     force=args.force,
     dir=args.dir,
     extra_prompt=args.prompt,
+    on_progress=_stream_to_stderr,
   )
   sys.stdout.write(md)
   if not md.endswith("\n"):
@@ -502,6 +511,7 @@ def _note_json_record(c, file_id, args) -> list[dict]:
       force=args.force,
       dir=args.dir,
       extra_prompt=extra_prompt,
+      on_progress=_stream_to_stderr,
     )
     page_ocr = dict(api._parse_note_markdown(md))
     # Device transcripts aren't cached on disk; re-fetch via supernotelib by
@@ -541,6 +551,7 @@ def _note_json_record(c, file_id, args) -> list[dict]:
       pages = api.ocr_note_from_cloud(
         c, file_id, workdir,
         model=args.model, force=args.force, extra_prompt=extra_prompt,
+        on_progress=_stream_to_stderr,
       )
   return [
     {

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import requests
@@ -96,6 +99,7 @@ def ocr_base64(
   host: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
   extra_prompt: str | None = None,
+  on_token: Callable[[str], None] | None = None,
 ) -> str:
   """POST an already-base64-JPEG image to Ollama's chat endpoint.
 
@@ -103,23 +107,30 @@ def ocr_base64(
   HTTP error, or unexpected response shape. `extra_prompt`, if provided,
   is appended to the default OCR prompt under an "Additional instructions:"
   section — useful for project-specific transcription rules.
+
+  When `on_token` is provided, the request is streamed and the callback
+  is invoked once per Ollama chunk with the text delta. The full string
+  is still returned. When `on_token` is None, behaves as a single
+  blocking POST (no streaming overhead).
   """
-  h = host or default_host()
+  streaming = on_token is not None
+  payload = {
+    "model": model,
+    "messages": [
+      {
+        "role": "user",
+        "content": _build_prompt(extra_prompt),
+        "images": [image_base64],
+      }
+    ],
+    "stream": streaming,
+  }
   try:
     response = requests.post(
-      f"{h}/api/chat",
-      json={
-        "model": model,
-        "messages": [
-          {
-            "role": "user",
-            "content": _build_prompt(extra_prompt),
-            "images": [image_base64],
-          }
-        ],
-        "stream": False,
-      },
+      f"{host or default_host()}/api/chat",
+      json=payload,
       timeout=timeout,
+      stream=streaming,
     )
   except requests.RequestException as e:
     raise OcrError(f"Ollama request failed: {type(e).__name__}: {e}") from e
@@ -132,16 +143,69 @@ def ocr_base64(
       pass
     raise OcrError(f"Ollama returned HTTP {response.status_code}: {detail}")
 
-  try:
-    data = response.json()
-  except ValueError as e:
-    raise OcrError(f"Ollama returned non-JSON: {response.text[:200]}") from e
+  if not streaming:
+    try:
+      data = response.json()
+    except ValueError as e:
+      raise OcrError(f"Ollama returned non-JSON: {response.text[:200]}") from e
+    if "message" in data and "content" in data["message"]:
+      return data["message"]["content"].strip()
+    if "response" in data:
+      return data["response"].strip()
+    raise OcrError(f"Unexpected Ollama response shape: {data}")
 
-  if "message" in data and "content" in data["message"]:
-    return data["message"]["content"].strip()
-  if "response" in data:
-    return data["response"].strip()
-  raise OcrError(f"Unexpected Ollama response shape: {data}")
+  # Streaming: each line is a JSON object with a partial message.content.
+  # Final chunk has done=true and may include a final aggregated message.
+  #
+  # Liveness: the model can take many seconds before the first token (image
+  # encode + GPU model load on a cold call). To keep the CLI feeling alive,
+  # a background thread emits a dot per second until either the first
+  # content token arrives or the stream finishes. Dots go through `on_token`
+  # but are NOT appended to `parts` — the returned string stays clean.
+  parts: list[str] = []
+  first_seen = False
+  stop = threading.Event()
+
+  def _tick():
+    while not stop.wait(1.0):
+      on_token(".")
+
+  spinner = threading.Thread(target=_tick, daemon=True)
+  spinner.start()
+  try:
+    for raw in response.iter_lines():
+      if not raw:
+        continue
+      try:
+        chunk = json.loads(raw)
+      except ValueError:
+        continue
+      msg = chunk.get("message") or {}
+      thinking = msg.get("thinking") or ""
+      delta = msg.get("content") or chunk.get("response") or ""
+
+      if thinking:
+        # Surface fragmentary reasoning when the model emits it (Ollama
+        # exposes this for thinking-capable models). Prefix once so it's
+        # visually distinct from the final OCR output.
+        if not first_seen:
+          first_seen = True
+          stop.set()
+          on_token("\n")
+        on_token(thinking)
+      if delta:
+        if not first_seen:
+          first_seen = True
+          stop.set()
+          on_token("\n")
+        on_token(delta)
+        parts.append(delta)
+      if chunk.get("done"):
+        break
+  finally:
+    stop.set()
+    spinner.join(timeout=0.1)
+  return "".join(parts).strip()
 
 
 def ocr_image(
@@ -152,12 +216,15 @@ def ocr_image(
   host: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
   extra_prompt: str | None = None,
+  on_token: Callable[[str], None] | None = None,
 ) -> str:
   """Run OCR on an image path or PIL Image via local Ollama vision.
 
   Raises `OcrError` on any failure. `extra_prompt` is appended to the
   default OCR prompt — used for project-specific transcription rules
-  (e.g. "preserve lines starting with → or ☐ verbatim").
+  (e.g. "preserve lines starting with → or ☐ verbatim"). When `on_token`
+  is provided, the call streams from Ollama and invokes the callback
+  per chunk so callers can render progress as it arrives.
   """
   if isinstance(image, (str, Path)):
     img = Image.open(image)
@@ -166,5 +233,10 @@ def ocr_image(
   img = resize_for_ocr(img, max_size=max_size)
   payload = image_to_base64_jpeg(img)
   return ocr_base64(
-    payload, model=model, host=host, timeout=timeout, extra_prompt=extra_prompt
+    payload,
+    model=model,
+    host=host,
+    timeout=timeout,
+    extra_prompt=extra_prompt,
+    on_token=on_token,
   )

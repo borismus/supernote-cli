@@ -399,3 +399,73 @@ def test_build_prompt_strips_surrounding_whitespace():
 
   out = _build_prompt("\n\nhello\n\n  ")
   assert out.endswith("Additional instructions:\nhello")
+
+
+# ---- OCR streaming ----
+
+
+def test_ocr_base64_streaming_calls_callback_per_chunk(monkeypatch):
+  """Verify ocr_base64 with on_token consumes line-delimited JSON chunks."""
+  from supernote_cli import ocr
+
+  chunks_jsonl = [
+    b'{"message": {"content": "Hello"}, "done": false}',
+    b'{"message": {"content": " world"}, "done": false}',
+    b'{"message": {"content": "!"}, "done": true}',
+  ]
+
+  class FakeResponse:
+    status_code = 200
+
+    def iter_lines(self):
+      yield from chunks_jsonl
+
+  captured_payload = {}
+
+  def fake_post(url, json=None, timeout=None, stream=None, **kw):
+    captured_payload["json"] = json
+    captured_payload["stream"] = stream
+    return FakeResponse()
+
+  monkeypatch.setattr(ocr.requests, "post", fake_post)
+
+  received: list[str] = []
+  out = ocr.ocr_base64("abc", on_token=received.append)
+
+  # Return value aggregates only content deltas — spinner dots and the
+  # newline that clears them are passed to on_token but NOT into parts.
+  assert out == "Hello world!"
+  # The first content arrival writes a newline (to clear any spinner dots
+  # already on stderr). Background spinner is unlikely to fire in this
+  # sub-second synchronous test, but we tolerate stray '.' tokens too.
+  content_only = [t for t in received if t not in ("\n", ".")]
+  assert content_only == ["Hello", " world", "!"]
+  # And: a clearing newline was emitted before content started.
+  assert "\n" in received
+  assert captured_payload["stream"] is True
+  assert captured_payload["json"]["stream"] is True
+
+
+def test_ocr_base64_non_streaming_when_no_callback(monkeypatch):
+  """No on_token => plain JSON request, single response, no stream=True."""
+  from supernote_cli import ocr
+
+  class FakeResponse:
+    status_code = 200
+
+    def json(self):
+      return {"message": {"content": "Full text. "}}
+
+  captured_payload = {}
+
+  def fake_post(url, json=None, timeout=None, stream=None, **kw):
+    captured_payload["json"] = json
+    captured_payload["stream"] = stream
+    return FakeResponse()
+
+  monkeypatch.setattr(ocr.requests, "post", fake_post)
+
+  out = ocr.ocr_base64("abc")
+  assert out == "Full text."  # strip()-ed
+  assert captured_payload["stream"] is False
+  assert captured_payload["json"]["stream"] is False
