@@ -593,6 +593,56 @@ def ocr_note_from_cloud(
     )
 
 
+class NoteNotFound(Exception):
+  pass
+
+
+class NoteAmbiguous(Exception):
+  def __init__(self, target: str, matches: list[str]):
+    self.target = target
+    self.matches = matches
+    super().__init__(f"target '{target}' matches multiple notes: {', '.join(matches)}")
+
+
+def resolve_note(client: Client, target: str) -> Note:
+  """Resolve a `note` CLI target to a `Note` record.
+
+  Accepts:
+    - a numeric id (all digits)
+    - a full path: `Note/.../foo.note`
+    - a basename: `foo.note` or `foo` (`.note` suffix optional)
+
+  Raises NoteNotFound or NoteAmbiguous on lookup failure.
+  """
+  pairs = list_notes(client, folder_path="Note", recursive=True)
+
+  if target.isdigit():
+    for _, n in pairs:
+      if n.id == target:
+        return n
+    raise NoteNotFound(f"no note with id {target}")
+
+  if "/" in target:
+    needle = target.lstrip("/")
+    if needle.startswith("Note/"):
+      needle = needle[len("Note/"):]
+    for fp, n in pairs:
+      rel = fp[len("Note"):].lstrip("/")
+      full_rel = f"{rel}/{n.file_name}" if rel else n.file_name
+      if full_rel == needle:
+        return n
+    raise NoteNotFound(f"no note at path {target}")
+
+  basename = target if target.endswith(".note") else f"{target}.note"
+  matches = [(fp, n) for fp, n in pairs if n.file_name == basename]
+  if not matches:
+    raise NoteNotFound(f"no note named {basename}")
+  if len(matches) > 1:
+    paths = [f"{fp[len('Note'):].lstrip('/')}/{n.file_name}".lstrip("/") for fp, n in matches]
+    raise NoteAmbiguous(target, paths)
+  return matches[0][1]
+
+
 def list_notes(
   client: Client,
   folder_path: str = "Note",

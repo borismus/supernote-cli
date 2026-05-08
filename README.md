@@ -50,7 +50,7 @@ supernote digest <id>[,<id>...] \                     # blockquote to stdout; no
          [-o PATH] [--ocr {supernote,ollama}] [--model M] [--force] [--json] [--prompt TEXT]
 
 supernote note ls [--days-ago N] [--limit N] [--json]
-supernote note <file-id> \                            # device transcript to stdout; nothing written
+supernote note <name|path|id> \                       # device transcript to stdout; nothing written
          [-o DIR] [--ocr {supernote,ollama}] [--model M] [--force] [--json] [--prompt TEXT]
 ```
 
@@ -127,12 +127,24 @@ Pass `--json` for the structured shape (Supernote's own terms):
 
 Multiple comma-separated IDs print one markdown block per digest (separated by a blank line) or a JSON array. `-o file.png` requires a single id; `-o dir/` allows multiple ids when `--ocr ollama` is off.
 
-### `note <id>` — device transcript to stdout; `-o` for page PNGs, `--ocr ollama` for LLM transcription
+### `note <name|path|id>` — device transcript to stdout; `-o` for page PNGs, `--ocr ollama` for LLM transcription
 
-By default, `note <id>` prints the device-side handwriting transcript that the Supernote tablet wrote into the `.note` file. Nothing is written to disk:
+The note target is resolved in this order:
+
+- **All-digits** → numeric file id.
+- **Contains `/`** → full path under `Note/` (or absolute `Note/sub/foo.note`).
+- **Otherwise** → basename (with or without `.note` suffix). If multiple notes share that basename across folders, the resolver errors with the matching paths so you can disambiguate.
+
+`note ls` now emits `mtime  name`, sorted oldest-first / newest-last (so the latest note is right above your prompt). Names are shown without the `.note` suffix; the resolver re-appends it transparently. Use `--json` for the full record (id, folder_path, file_name, size, update_time).
 
 ```
-$ supernote note 1251704781014040577
+$ supernote note ls --limit 5
+2026-04-24 08:11  San Francisco Note, April 20
+2026-04-27 07:36  20260424_081053
+2026-05-01 07:39  20260429_132435
+2026-05-05 21:10  Eliana 2
+2026-05-05 21:21  20260501_073927
+$ supernote note 20260501_073927
 ## Page 1
 
 (device-OCR transcript for page 1, written by the tablet)
@@ -229,7 +241,7 @@ for p in pages:
 
 ## Status
 
-- v0.3 (breaking): `digest <id>` / `note <id>` defaults are minimal — no PNGs persisted, no Ollama. Stdout is just the blockquote (digest) or the device transcript per page (note). Pass `-o PATH` to persist PNGs (digest accepts `file.png` or a dir; note accepts a dir). Pass `--ocr {supernote,ollama}` (default `supernote`) to control transcription; `--ocr ollama` runs vision OCR (replacing the old `--no-ocr` boolean). When a digest has untranscribed handwriting and no flags pull it, a one-line hint is printed to stderr. `--dir` renamed to `-o/--output`. `render_digest_markdown` and `render_note_markdown` take an optional `output` arg and `ocr_engine="supernote"|"ollama"`. `render_handwriting` writes `{digest_id}.png` / `{digest_id}_pN.png`.
+- v0.3 (breaking): `digest <id>` / `note <id>` defaults are minimal — no PNGs persisted, no Ollama. Stdout is just the blockquote (digest) or the device transcript per page (note). Pass `-o PATH` to persist PNGs (digest accepts `file.png` or a dir; note accepts a dir). Pass `--ocr {supernote,ollama}` (default `supernote`) to control transcription; `--ocr ollama` runs vision OCR (replacing the old `--no-ocr` boolean). When a digest has untranscribed handwriting and no flags pull it, a one-line hint is printed to stderr. `--dir` renamed to `-o/--output`. `note <TARGET>` now accepts a basename (e.g. `20260501_073927` with or without `.note`), a full path (`Note/sub/foo.note`), or a numeric id; `note ls` shows `mtime  name`, sorted newest-last. `render_digest_markdown` and `render_note_markdown` take an optional `output` arg and `ocr_engine="supernote"|"ollama"`. `render_handwriting` writes `{digest_id}.png` / `{digest_id}_pN.png`. New API: `api.resolve_note(client, target)` returns the matching `Note` (raises `NoteNotFound` / `NoteAmbiguous`).
 - v0.2 (breaking): standardized `-o/--output` across commands, path-based `download` / `delete` (with `--by-id` fallback), JSON-always output for `digest <id>` / `note <id>` using Supernote terms (`digest` / `annotation` / `handwritten_image`), new `upload` and `delete` verbs.
 - `.note` OCR: `list_notes`, `render_note`, `extract_note_text`, `ocr_note` (local file), `ocr_note_from_cloud` (by file id), `ocr_image` in `supernote_cli.api` / `supernote_cli.ocr`.
 - Upload: `api.upload_file(client, local_path, remote_dir, overwrite=False)` and `supernote upload` CLI. Implements Supernote's `file/upload/apply` → signed S3 PUT → `file/upload/finish` flow; `remote_dir` must already exist (no auto-mkdir).

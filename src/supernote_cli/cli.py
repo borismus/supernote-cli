@@ -223,7 +223,7 @@ def _build_parser() -> argparse.ArgumentParser:
       "transcript for Ollama vision OCR."
     ),
   )
-  nt.add_argument("target", help="'ls' to list .note files, or a cloud file id to fetch one")
+  nt.add_argument("target", help="'ls' to list .note files, or a target to fetch: basename (foo.note or foo), full path (Note/sub/foo.note), or numeric file id")
   # ls
   nt.add_argument("--limit", type=int, default=50, help="(ls only) max records to list")
   nt.add_argument("--days-ago", dest="days_ago", type=int, help="(ls only) only include files modified within N days")
@@ -606,11 +606,14 @@ def _cmd_note(args) -> int:
 def _note_ls(args) -> int:
   c = _client_from_args(args)
   pairs = api.list_notes(c, folder_path="Note", recursive=True)
-  pairs.sort(key=lambda pn: pn[1].update_time, reverse=True)
   if args.days_ago is not None:
     cutoff = dt.datetime.now() - dt.timedelta(days=args.days_ago)
     pairs = [(fp, n) for fp, n in pairs if n.update_time >= cutoff]
+  # Sort newest-first to apply --limit, then reverse so most recent is last
+  # (natural for a terminal — the latest entry is right above your prompt).
+  pairs.sort(key=lambda pn: pn[1].update_time, reverse=True)
   pairs = pairs[: args.limit]
+  pairs.reverse()
   if args.as_json:
     print(json.dumps(
       [
@@ -623,15 +626,28 @@ def _note_ls(args) -> int:
   if not pairs:
     print("(no .note files)")
     return 0
+  basenames = [n.file_name for _, n in pairs]
+  collisions = {b for b in basenames if basenames.count(b) > 1}
   for fp, n in pairs:
     mtime = n.update_time.strftime("%Y-%m-%d %H:%M")
-    print(f"{n.size:>10}  {mtime}  {n.id:>20}  {fp}/{n.file_name}")
+    name = n.file_name[:-5] if n.file_name.endswith(".note") else n.file_name
+    if n.file_name in collisions:
+      rel = fp[len("Note"):].lstrip("/")
+      label = f"{rel}/{name}" if rel else name
+    else:
+      label = name
+    print(f"{mtime}  {label}")
   return 0
 
 
 def _note_show(args) -> int:
   c = _client_from_args(args)
-  file_id = args.target
+  try:
+    note = api.resolve_note(c, args.target)
+  except (api.NoteNotFound, api.NoteAmbiguous) as e:
+    print(f"error: {e}", file=sys.stderr)
+    return 2
+  file_id = note.id
   use_ollama = args.ocr == "ollama"
 
   if args.prompt and not use_ollama:
