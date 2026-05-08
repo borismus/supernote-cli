@@ -46,12 +46,12 @@ supernote sync <path> -o DIR \
 supernote source ls [--days-ago N] [--limit N] [--json]
 
 supernote digest ls [--limit N] [--days-ago N] [--json]
-supernote digest <id>[,<id>...] \                     # markdown to stdout (--json for v0.2 JSON)
-         [--dir DIR] [--no-ocr] [--model M] [--force] [--json] [--prompt TEXT]
+supernote digest <id>[,<id>...] \                     # blockquote to stdout; nothing written
+         [-o PATH] [--ocr {supernote,ollama}] [--model M] [--force] [--json] [--prompt TEXT]
 
 supernote note ls [--days-ago N] [--limit N] [--json]
-supernote note <file-id> \                            # markdown to stdout (--json for v0.2 JSON)
-         [--dir DIR] [--no-ocr] [--model M] [--force] [--json] [--prompt TEXT]
+supernote note <file-id> \                            # device transcript to stdout; nothing written
+         [-o DIR] [--ocr {supernote,ollama}] [--model M] [--force] [--json] [--prompt TEXT]
 ```
 
 Global flags: `--no-cache`, `--verbose`, `--equipment-no`.
@@ -60,23 +60,55 @@ Global flags: `--no-cache`, `--verbose`, `--equipment-no`.
 
 Most commands take a remote path (`Note/Inbox/foo.note`). `download` and `delete` also accept `--by-id <ID>` as an escape hatch. `upload` expects the destination folder to already exist — it won't create missing folders. `delete` removes the remote file immediately with no confirmation prompt; `upload --overwrite` uses it internally and waits for the deletion to propagate server-side before re-uploading.
 
-### `digest <id>` — markdown by default; `--json` for structured
+### `digest <id>` — blockquote to stdout; `-o` for the PNG, `--ocr ollama` for LLM transcription
 
-The default emits a light blockquote-then-OCR markdown to stdout, no files:
+By default, `digest <id>` prints just the highlighted passage. Nothing
+is written to disk:
 
 ```
 $ supernote digest 832783777540341760
 > I've decided to throw my chemoreceptors into the ring...
-
-could this be something for dad to look into?
 ```
 
 - The `>` block is the highlighted passage Supernote already transcribed (`digest.content`).
-- The body below is the Ollama OCR of the handwritten note you drew on top.
-- Highlight-only digests (no handwriting) print just the blockquote.
-- `--no-ocr` skips the OCR step (fast path).
+- If the digest also has a handwritten annotation, a one-line note is printed to **stderr**: `note: digest <id> has untranscribed handwriting; pass --ocr ollama to transcribe (or -o PATH to save the PNG)`. This keeps stdout clean for piping while making sure you know there's more to pull.
 
-Pass `--dir DIR` to also persist `page_N.png` + `content.md` (byte-identical to stdout) into DIR. On re-run, `content.md` is the cache — instant unless `--force`.
+Pass `-o PATH` to also persist the rendered handwriting PNG. `PATH` ending in `.png` is treated as a file path; otherwise it's a directory:
+
+```
+$ supernote digest 832783777540341760 -o ann.png
+> I've decided to throw my chemoreceptors into the ring...
+
+_(no transcript)_
+
+![](ann.png)
+$ ls
+ann.png
+```
+
+```
+$ supernote digest 832783777540341760 -o annotations/
+> I've decided to throw my chemoreceptors into the ring...
+
+_(no transcript)_
+
+![](annotations/832783777540341760.png)
+```
+
+Multi-page digests fan out as `{stem}_p1.png`, `{stem}_p2.png`, ... in file mode and `{digest_id}_p1.png`, `{digest_id}_p2.png`, ... in dir mode.
+
+Pass `--ocr ollama` to transcribe the handwriting via local Ollama vision OCR. With `-o`, the OCR text replaces the placeholder and a sibling `content.md` (file mode: `{stem}.md`; dir mode: `content.md`) is written as a cache marker:
+
+```
+$ supernote digest 832783777540341760 --ocr ollama -o ann.png
+> I've decided to throw my chemoreceptors into the ring...
+
+could this be something for dad to look into?
+
+![](ann.png)
+```
+
+Without `-o`, `--ocr ollama` still works — the PNG renders to a tempdir, gets OCR'd, and is discarded. Stdout is just `blockquote + ocr text`.
 
 Pass `--json` for the structured shape (Supernote's own terms):
 
@@ -85,55 +117,69 @@ Pass `--json` for the structured shape (Supernote's own terms):
   "id": "832783687476051968",
   "digest": "just as we've become a culture of overeaters...",
   "annotation": "completely correlated",
-  "handwritten_image": "page_1.png",
+  "handwritten_image": "./832783687476051968.png",
   "source_path": "/Document/Breath.epub",
   "last_modified": "2026-04-18T11:42:00"
 }
 ```
 
-`--json` and `--dir` compose: JSON to stdout, files to DIR. Without `--dir`, `handwritten_image` is `null`. With multi-page handwriting it's an array.
+`handwritten_image` is `null` unless `-o` was passed. `annotation` is `null` unless `--ocr ollama` was passed. With multi-page handwriting `handwritten_image` is an array.
 
-Multiple comma-separated IDs print one markdown block per digest (separated by a blank line) or a JSON array. `--dir` requires a single ID.
+Multiple comma-separated IDs print one markdown block per digest (separated by a blank line) or a JSON array. `-o file.png` requires a single id; `-o dir/` allows multiple ids when `--ocr ollama` is off.
 
-### `note <id>` — markdown by default; `--json` for structured
+### `note <id>` — device transcript to stdout; `-o` for page PNGs, `--ocr ollama` for LLM transcription
 
-Default: markdown per page to stdout, no files.
+By default, `note <id>` prints the device-side handwriting transcript that the Supernote tablet wrote into the `.note` file. Nothing is written to disk:
 
 ```
 $ supernote note 1251704781014040577
 ## Page 1
 
-(your handwritten notes, OCR'd page-by-page)
+(device-OCR transcript for page 1, written by the tablet)
 
 ## Page 2
 
 ...
 ```
 
-Pass `--dir DIR` to also persist `page_N.png` + `content.md` and enable cache-on-rerun. Pass `--json` for the v0.2 per-page structured array:
+- Pages where device OCR was off (or produced no recognizable text) render as `_(no transcript)_`.
+- No PNGs are rendered or persisted in this default path — only the .note file is downloaded.
+
+Pass `-o DIR` to also render and persist `page_N.png` into `DIR`. The markdown then includes per-page `![](DIR/page_N.png)` refs.
+
+Pass `--ocr ollama` to run local Ollama vision OCR per page instead of the device transcript (higher quality, slower, requires Ollama). With `-o`, `content.md` is written into the dir as a cache marker; without `-o`, PNGs render to a tempdir and are discarded after OCR.
+
+Pass `--json` for the v0.2 per-page structured array:
 
 ```json
 [
   {
     "page": 1,
     "transcript": "device OCR text from supernotelib",
-    "annotation": "Ollama OCR text",
-    "handwritten_image": "page_1.png"
+    "annotation": "Ollama OCR text (null without --ocr ollama)",
+    "handwritten_image": "MyNotebook/page_1.png"
   }
 ]
 ```
 
-Without `--dir`, `handwritten_image` is `null`.
+### `--ocr` engines
+
+Both `digest <id>` and `note <id>` accept `--ocr {supernote,ollama}`:
+
+| Engine | `note` behavior | `digest` behavior |
+|---|---|---|
+| `supernote` (default) | per-page device transcript from supernotelib (`extract_note_text`); empty pages render `_(no transcript)_` | no annotation transcription (Supernote's device OCR doesn't cover digest handwriting); without `-o` a stderr hint is printed when handwriting exists; with `-o` the body shows `_(no transcript)_` next to the image ref |
+| `ollama` | per-page Ollama vision OCR; replaces device transcript | per-page Ollama vision OCR of the rendered handwriting PNG(s) |
 
 ### Custom OCR prompt
 
-Both `digest <id>` and `note <id>` accept `--prompt TEXT` to layer project-specific transcription rules on top of the default OCR prompt. Useful for preserving inline markers verbatim:
+`--prompt TEXT` (only meaningful with `--ocr ollama`) layers project-specific transcription rules on top of the default OCR prompt. Useful for preserving inline markers verbatim:
 
 ```
-$ supernote note <id> --prompt "When a line begins with → or ☐, transcribe it verbatim including the leading symbol; preserve multi-line continuation."
+$ supernote note <id> --ocr ollama --prompt "When a line begins with → or ☐, transcribe it verbatim including the leading symbol; preserve multi-line continuation."
 ```
 
-The text is appended under an `Additional instructions:` section after the default OCR prompt. **The `--dir` cache key is `content.md` alone — it does not track the prompt.** If you change the prompt and want fresh output, pass `--force` to invalidate.
+The text is appended under an `Additional instructions:` section after the default OCR prompt. **The `content.md` cache does not track the prompt.** If you change the prompt and want fresh output, pass `--force` to invalidate.
 
 ### Ollama
 
@@ -150,17 +196,21 @@ c = Client.from_env()             # loads .env + cached token
 for folder_path, note in api.list_notes(c):
     print(note.id, f"{folder_path}/{note.file_name}")
 
-# Build the same markdown the CLI prints. Pass dir="..." to also persist
-# page_N.png + content.md and enable cache-on-rerun.
-md = api.render_digest_markdown(c, digest)                     # blockquote + OCR
-md = api.render_note_markdown(c, file_id, dir="/tmp/mynote")   # per-page OCR + cache
+# Build the same markdown the CLI prints. `output` is optional:
+#   None (default) → no PNG persisted; transcripts/blockquote only.
+#   PathLike       → PNG(s) written; markdown includes image refs.
+#                    For digests, suffix `.png` selects file mode.
+md = api.render_digest_markdown(c, digest)                         # just the blockquote
+md = api.render_digest_markdown(c, digest, "ann.png", ocr_engine="ollama")  # PNG + Ollama
+md = api.render_note_markdown(c, file_id)                          # device transcripts only
+md = api.render_note_markdown(c, file_id, "/tmp/mynote", ocr_engine="ollama")  # PNGs + Ollama
 
 # Group digests by source document (PDF/EPUB) and get full Digest records
 for src in api.list_digested_sources(c, days_ago=30):
     print(src.source_stem, len(src.digests))
     # Lower-level: render handwriting PNGs only (no OCR)
     for d in src.digests:
-        paths = api.render_handwriting(c, d, "/tmp/hw")  # writes page_N.png
+        paths = api.render_handwriting(c, d, "/tmp/hw")  # writes {digest_id}.png
         if paths:
             print(d.id, "->", paths)
 
@@ -179,7 +229,8 @@ for p in pages:
 
 ## Status
 
-- v0.2 (breaking): standardized `-o/--output` across commands, path-based `download` / `delete` (with `--by-id` fallback), JSON-always output for `digest <id>` / `note <id>` using Supernote terms (`digest` / `annotation` / `handwritten_image`), OCR default on with hard-fail on Ollama unreachable, new `upload` and `delete` verbs.
+- v0.3 (breaking): `digest <id>` / `note <id>` defaults are minimal — no PNGs persisted, no Ollama. Stdout is just the blockquote (digest) or the device transcript per page (note). Pass `-o PATH` to persist PNGs (digest accepts `file.png` or a dir; note accepts a dir). Pass `--ocr {supernote,ollama}` (default `supernote`) to control transcription; `--ocr ollama` runs vision OCR (replacing the old `--no-ocr` boolean). When a digest has untranscribed handwriting and no flags pull it, a one-line hint is printed to stderr. `--dir` renamed to `-o/--output`. `render_digest_markdown` and `render_note_markdown` take an optional `output` arg and `ocr_engine="supernote"|"ollama"`. `render_handwriting` writes `{digest_id}.png` / `{digest_id}_pN.png`.
+- v0.2 (breaking): standardized `-o/--output` across commands, path-based `download` / `delete` (with `--by-id` fallback), JSON-always output for `digest <id>` / `note <id>` using Supernote terms (`digest` / `annotation` / `handwritten_image`), new `upload` and `delete` verbs.
 - `.note` OCR: `list_notes`, `render_note`, `extract_note_text`, `ocr_note` (local file), `ocr_note_from_cloud` (by file id), `ocr_image` in `supernote_cli.api` / `supernote_cli.ocr`.
 - Upload: `api.upload_file(client, local_path, remote_dir, overwrite=False)` and `supernote upload` CLI. Implements Supernote's `file/upload/apply` → signed S3 PUT → `file/upload/finish` flow; `remote_dir` must already exist (no auto-mkdir).
 - Not yet on PyPI. Install via `uv tool install git+https://github.com/borismus/supernote-cli` or add a local path dep (`{ path = "…", editable = true }`). Planned to publish after living with the API for a bit — see the publish playbook in [docs/publishing.md](docs/publishing.md).

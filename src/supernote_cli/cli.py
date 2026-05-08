@@ -178,9 +178,10 @@ def _build_parser() -> argparse.ArgumentParser:
     help="digest (highlight + annotation) commands",
     description=(
       "Run `digest ls` to list digest summary records. With one or more "
-      "comma-separated digest IDs, print markdown to stdout (blockquoted "
-      "highlight + OCR of the handwritten annotation). Use --json for the "
-      "v0.2 JSON shape, or --dir DIR to also persist page_N.png + content.md."
+      "comma-separated digest IDs, print the blockquoted highlight to "
+      "stdout. Pass `-o PATH` to also persist the handwriting PNG "
+      "(file or dir); pass `--ocr ollama` to also transcribe the "
+      "handwriting via local Ollama vision OCR."
     ),
   )
   dg.add_argument("target", help="'ls' to list, or digest id(s) comma-separated")
@@ -196,24 +197,30 @@ def _build_parser() -> argparse.ArgumentParser:
   )
   # <id>
   dg.add_argument(
-    "--dir",
-    dest="dir",
+    "-o", "--output",
+    dest="output",
     default=None,
-    help="(id form) directory to persist page_N.png + content.md; cache-on-rerun unless --force",
+    help="(id form) write the handwriting PNG. Path ending in .png is a file path (single PNG; multi-page fans to {stem}_pN.png); otherwise a directory ({digest_id}.png inside). Default: no PNG persisted.",
   )
-  dg.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="(id form) skip Ollama OCR of the handwritten annotation")
-  dg.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
-  dg.add_argument("--force", action="store_true", help="(id form) ignore cached content.md and re-render/re-OCR")
-  dg.add_argument("--prompt", dest="prompt", help="(id form) extra OCR instructions appended to the default prompt")
+  dg.add_argument(
+    "--ocr",
+    dest="ocr",
+    choices=("supernote", "ollama"),
+    default="supernote",
+    help="(id form) handwriting transcription engine. 'supernote' (default): no annotation transcript (Supernote's device OCR doesn't cover digest handwriting; the markdown shows '_(no transcript)_'). 'ollama': run local Ollama vision OCR.",
+  )
+  dg.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr ollama) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  dg.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
+  dg.add_argument("--prompt", dest="prompt", help="(id form, with --ocr ollama) extra OCR instructions appended to the default prompt")
 
   nt = sub.add_parser(
     "note",
     help=".note file commands",
     description=(
       "Run `note ls` to list .note files under /Note/. With a numeric file id, "
-      "OCR each page via Ollama vision and print markdown to stdout. Use "
-      "--json for the v0.2 per-page JSON, or --dir DIR to also persist "
-      "page_N.png + content.md."
+      "print the device-OCR transcript per page. Pass `-o DIR` to also "
+      "persist `page_N.png`; pass `--ocr ollama` to swap the device "
+      "transcript for Ollama vision OCR."
     ),
   )
   nt.add_argument("target", help="'ls' to list .note files, or a cloud file id to fetch one")
@@ -229,15 +236,21 @@ def _build_parser() -> argparse.ArgumentParser:
   )
   # <id>
   nt.add_argument(
-    "--dir",
-    dest="dir",
+    "-o", "--output",
+    dest="output",
     default=None,
-    help="(id form) directory to persist page_N.png + content.md; cache-on-rerun unless --force",
+    help="(id form) directory to write page_N.png (and content.md when --ocr ollama). Default: no PNGs persisted, transcripts only.",
   )
-  nt.add_argument("--no-ocr", dest="no_ocr", action="store_true", help="(id form) skip Ollama OCR on each page")
-  nt.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
-  nt.add_argument("--force", action="store_true", help="(id form) ignore cached content.md and re-render/re-OCR")
-  nt.add_argument("--prompt", dest="prompt", help="(id form) extra OCR instructions appended to the default prompt")
+  nt.add_argument(
+    "--ocr",
+    dest="ocr",
+    choices=("supernote", "ollama"),
+    default="supernote",
+    help="(id form) handwriting transcription engine. 'supernote' (default): use the device's on-tablet OCR transcript per page (pages with no transcript show '_(no transcript)_'). 'ollama': run local Ollama vision OCR per page.",
+  )
+  nt.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr ollama) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  nt.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
+  nt.add_argument("--prompt", dest="prompt", help="(id form, with --ocr ollama) extra OCR instructions appended to the default prompt")
 
   return p
 
@@ -437,15 +450,27 @@ def _digest_ls(args) -> int:
 def _digest_show(args) -> int:
   c = _client_from_args(args)
   ids = [i.strip() for i in args.target.split(",") if i.strip()]
+  use_ollama = args.ocr == "ollama"
 
-  if args.dir is not None and len(ids) > 1:
-    print(
-      "error: --dir is per-digest; pass a single id or run multiple commands",
-      file=sys.stderr,
-    )
-    return 2
+  if args.output is not None and len(ids) > 1:
+    is_file_mode = args.output.lower().endswith(".png")
+    if is_file_mode:
+      print(
+        "error: -o file.png is single-id; pass a single digest id or use a directory",
+        file=sys.stderr,
+      )
+      return 2
+    if use_ollama:
+      print(
+        "error: -o with --ocr ollama is per-digest (content.md collides); pass a single id",
+        file=sys.stderr,
+      )
+      return 2
 
-  if not args.no_ocr:
+  if args.prompt and not use_ollama:
+    print("warning: --prompt has no effect without --ocr ollama", file=sys.stderr)
+
+  if use_ollama:
     try:
       ocr.check_available()
     except ocr.OcrError as e:
@@ -467,7 +492,6 @@ def _digest_show(args) -> int:
     return 0
 
   # Markdown path.
-  extra_prompt = args.prompt
   marquee = _Marquee()
   try:
     for i, did in enumerate(ids):
@@ -476,12 +500,11 @@ def _digest_show(args) -> int:
         print(f"warning: digest {did} not found", file=sys.stderr)
         continue
       md = api.render_digest_markdown(
-        c, d,
+        c, d, args.output,
         ocr_model=args.model,
-        no_ocr=args.no_ocr,
+        ocr_engine=args.ocr,
         force=args.force,
-        dir=args.dir,
-        extra_prompt=extra_prompt,
+        extra_prompt=args.prompt,
         on_page_start=marquee.page,
         on_token=marquee.token,
       )
@@ -490,23 +513,27 @@ def _digest_show(args) -> int:
       sys.stdout.write(md)
       if not md.endswith("\n"):
         sys.stdout.write("\n")
+      # Surface untranscribed-handwriting hint when nothing pulls it.
+      if d.has_annotation and args.output is None and not use_ollama:
+        print(
+          f"note: digest {d.id} has untranscribed handwriting; "
+          "pass --ocr ollama to transcribe (or -o PATH to save the PNG)",
+          file=sys.stderr,
+        )
   finally:
     marquee.close()
   return 0
 
 
 def _digest_json_record(c, digest, args) -> dict:
-  """Build a v0.2-shaped JSON record for a digest, leveraging --dir cache."""
-  # Always materialize markdown first (handles cache + fresh work uniformly),
-  # then parse it back to extract the OCR'd annotation text.
+  """Build a v0.2-shaped JSON record for a digest."""
   marquee = _Marquee()
   try:
     md = api.render_digest_markdown(
-      c, digest,
+      c, digest, args.output,
       ocr_model=args.model,
-      no_ocr=args.no_ocr,
+      ocr_engine=args.ocr,
       force=args.force,
-      dir=args.dir,
       extra_prompt=args.prompt,
       on_page_start=marquee.page,
       on_token=marquee.token,
@@ -524,11 +551,40 @@ def _digest_json_record(c, digest, args) -> dict:
     "last_modified": digest.last_modified_time.isoformat() if digest.last_modified_time else None,
   }
 
-  if args.dir is not None and digest.has_annotation:
-    rels = _list_page_pngs(Path(args.dir))
+  if digest.has_annotation and args.output is not None:
+    rels = _list_digest_image_refs(args.output, digest.id)
     if rels:
       rec["handwritten_image"] = rels[0] if len(rels) == 1 else rels
   return rec
+
+
+def _list_digest_image_refs(output: str, digest_id: str) -> list[str]:
+  """Enumerate the on-disk PNGs the digest produced under `-o`, returning
+  refs as they should appear in the markdown / JSON output."""
+  is_file = output.lower().endswith(".png")
+  p = Path(output)
+  if is_file:
+    if p.exists():
+      return [output]
+    parent = p.parent
+    stem = p.stem
+    refs = []
+    n = 1
+    ref_parent = output[: -len(p.name)]
+    while (parent / f"{stem}_p{n}.png").exists():
+      refs.append(f"{ref_parent}{stem}_p{n}.png")
+      n += 1
+    return refs
+  prefix = output.rstrip("/") + "/"
+  single = p / f"{digest_id}.png"
+  if single.exists():
+    return [f"{prefix}{single.name}"]
+  refs = []
+  n = 1
+  while (p / f"{digest_id}_p{n}.png").exists():
+    refs.append(f"{prefix}{digest_id}_p{n}.png")
+    n += 1
+  return refs
 
 
 def _list_page_pngs(dir: Path) -> list[str]:
@@ -576,8 +632,12 @@ def _note_ls(args) -> int:
 def _note_show(args) -> int:
   c = _client_from_args(args)
   file_id = args.target
+  use_ollama = args.ocr == "ollama"
 
-  if not args.no_ocr:
+  if args.prompt and not use_ollama:
+    print("warning: --prompt has no effect without --ocr ollama", file=sys.stderr)
+
+  if use_ollama:
     try:
       ocr.check_available()
     except ocr.OcrError as e:
@@ -592,11 +652,10 @@ def _note_show(args) -> int:
   marquee = _Marquee()
   try:
     md = api.render_note_markdown(
-      c, file_id,
+      c, file_id, args.output,
       ocr_model=args.model,
-      no_ocr=args.no_ocr,
+      ocr_engine=args.ocr,
       force=args.force,
-      dir=args.dir,
       extra_prompt=args.prompt,
       on_page_start=marquee.page,
       on_token=marquee.token,
@@ -610,85 +669,45 @@ def _note_show(args) -> int:
 
 
 def _note_json_record(c, file_id, args) -> list[dict]:
-  """Build the v0.2-shaped per-page JSON for a .note, leveraging --dir cache.
-
-  When --dir is given, we always have page_N.png on disk after the call;
-  we materialize markdown (cache or fresh), parse OCR back out, and pair
-  it with on-disk PNG names.
-
-  When --dir is None, we still need transcripts (device OCR) and PNG
-  paths, which the markdown helper doesn't expose. Fall back to the
-  underlying ocr_note_from_cloud, but skip OCR if --no-ocr.
-  """
-  extra_prompt = args.prompt
+  """Build the v0.2-shaped per-page JSON for a .note."""
   marquee = _Marquee()
-  if args.dir is not None:
-    try:
-      md = api.render_note_markdown(
-        c, file_id,
-        ocr_model=args.model,
-        no_ocr=args.no_ocr,
-        force=args.force,
-        dir=args.dir,
-        extra_prompt=extra_prompt,
-        on_page_start=marquee.page,
-        on_token=marquee.token,
-      )
-    finally:
-      marquee.close()
-    page_ocr = dict(api._parse_note_markdown(md))
-    # Device transcripts aren't cached on disk; re-fetch via supernotelib by
-    # downloading the .note again. Fast enough for the JSON path.
-    with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
-      api.download_file(c, file_id, Path(tmp.name))
-      transcripts = api.extract_note_text(tmp.name)
-    pngs = _list_page_pngs(Path(args.dir))
-    records = []
-    for i, png in enumerate(pngs):
-      records.append({
-        "page": i + 1,
-        "transcript": (transcripts[i] if i < len(transcripts) else "") or None,
-        "annotation": page_ocr.get(i + 1) or None,
-        "handwritten_image": png,
-      })
-    return records
+  try:
+    md = api.render_note_markdown(
+      c, file_id, args.output,
+      ocr_model=args.model,
+      ocr_engine=args.ocr,
+      force=args.force,
+      extra_prompt=args.prompt,
+      on_page_start=marquee.page,
+      on_token=marquee.token,
+    )
+  finally:
+    marquee.close()
 
-  # No --dir: do the full pipeline in a tempdir; emit JSON without persisting.
-  with tempfile.TemporaryDirectory() as td:
-    workdir = Path(td)
-    if args.no_ocr:
-      with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
-        api.download_file(c, file_id, Path(tmp.name))
-        api.render_note(tmp.name, workdir, force=args.force)
-        transcripts = api.extract_note_text(tmp.name)
-      pages = [
-        api.NotePage(
-          index=i + 1,
-          png_path=workdir / f"page_{i + 1}.png",
-          transcript=(transcripts[i] if i < len(transcripts) else "") or None,
-          ocr_text=None,
-        )
-        for i in range(len(transcripts))
-      ]
-    else:
-      try:
-        pages = api.ocr_note_from_cloud(
-          c, file_id, workdir,
-          model=args.model, force=args.force, extra_prompt=extra_prompt,
-          on_page_start=marquee.page, on_token=marquee.token,
-        )
-      finally:
-        marquee.close()
-  return [
-    {
-      "page": p.index,
-      "transcript": p.transcript,
-      "annotation": p.ocr_text,
-      "handwritten_image": None,
-    }
-    for p in pages
-  ]
-  return 0
+  page_ocr = dict(api._parse_note_markdown(md))
+  # Device transcripts aren't cached on disk; re-fetch via supernotelib by
+  # downloading the .note again. Fast enough for the JSON path.
+  with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
+    api.download_file(c, file_id, Path(tmp.name))
+    transcripts = api.extract_note_text(tmp.name)
+  use_ollama = args.ocr == "ollama"
+  prefix = (args.output.rstrip("/") + "/") if args.output is not None else ""
+  records = []
+  for i, transcript in enumerate(transcripts):
+    body = page_ocr.get(i + 1) or None
+    annotation = body if use_ollama else None
+    image_ref = None
+    if args.output is not None:
+      png_name = f"page_{i + 1}.png"
+      if (Path(args.output) / png_name).exists():
+        image_ref = f"{prefix}{png_name}"
+    records.append({
+      "page": i + 1,
+      "transcript": transcript or None,
+      "annotation": annotation,
+      "handwritten_image": image_ref,
+    })
+  return records
 
 
 def _note_dict(n) -> dict:

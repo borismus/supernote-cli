@@ -297,6 +297,21 @@ def test_compose_digest_markdown_multiline_highlight():
   assert md == "> Line one\n> Line two\n"
 
 
+def test_compose_digest_markdown_with_image_refs_no_ocr():
+  md = api._compose_digest_markdown("highlight", "", ["./123.png"])
+  assert md == "> highlight\n\n![](./123.png)\n"
+
+
+def test_compose_digest_markdown_with_image_refs_and_ocr():
+  md = api._compose_digest_markdown("hi", "annotation", ["./123.png"])
+  assert md == "> hi\n\nannotation\n\n![](./123.png)\n"
+
+
+def test_compose_digest_markdown_multipage_image_refs():
+  md = api._compose_digest_markdown("hi", "", ["./1_p1.png", "./1_p2.png"])
+  assert md == "> hi\n\n![](./1_p1.png)\n![](./1_p2.png)\n"
+
+
 def test_compose_note_markdown_concatenates_pages():
   from supernote_cli.api import NotePage
 
@@ -316,6 +331,54 @@ def test_compose_note_markdown_empty_ocr_renders_blank_section():
   pages = [NotePage(index=1, png_path=None, transcript=None, ocr_text=None)]
   md = api._compose_note_markdown(pages)
   assert md == "## Page 1\n\n\n"
+
+
+def test_compose_note_markdown_falls_back_to_transcript():
+  from supernote_cli.api import NotePage
+
+  pages = [NotePage(index=1, png_path=None, transcript="device text", ocr_text=None)]
+  md = api._compose_note_markdown(pages)
+  assert md == "## Page 1\n\ndevice text\n"
+
+
+def test_compose_note_markdown_with_image_refs():
+  from supernote_cli.api import NotePage
+
+  pages = [
+    NotePage(index=1, png_path=None, transcript="t1", ocr_text=None),
+    NotePage(index=2, png_path=None, transcript="t2", ocr_text=None),
+  ]
+  md = api._compose_note_markdown(pages, ["dir/page_1.png", "dir/page_2.png"])
+  assert "## Page 1\n\nt1\n\n![](dir/page_1.png)\n" in md
+  assert "## Page 2\n\nt2\n\n![](dir/page_2.png)\n" in md
+
+
+def test_compose_note_markdown_inserts_placeholder_when_empty():
+  from supernote_cli.api import NotePage, NO_TRANSCRIPT_PLACEHOLDER
+
+  pages = [
+    NotePage(index=1, png_path=None, transcript="t1", ocr_text=None),
+    NotePage(index=2, png_path=None, transcript=None, ocr_text=None),
+  ]
+  md = api._compose_note_markdown(pages, empty_placeholder=NO_TRANSCRIPT_PLACEHOLDER)
+  assert "## Page 1\n\nt1\n" in md
+  assert f"## Page 2\n\n{NO_TRANSCRIPT_PLACEHOLDER}\n" in md
+
+
+def test_parse_note_markdown_normalizes_placeholder_to_empty():
+  md = (
+    "## Page 1\n\nreal text\n\n"
+    "## Page 2\n\n_(no transcript)_\n"
+  )
+  pairs = api._parse_note_markdown(md)
+  assert pairs == [(1, "real text"), (2, "")]
+
+
+def test_parse_digest_markdown_normalizes_placeholder_to_none():
+  md = "> hi\n\n_(no transcript)_\n\n![](./1.png)\n"
+  highlight, body = api._parse_digest_markdown(md)
+  assert highlight == "hi"
+  assert body is None
 
 
 def test_parse_digest_markdown_with_ocr():
@@ -339,6 +402,20 @@ def test_parse_digest_markdown_multiline_highlight():
   assert ocr_body is None
 
 
+def test_parse_digest_markdown_strips_image_refs():
+  md = "> hi\n\nannotation\n\n![](./123.png)\n"
+  highlight, ocr_body = api._parse_digest_markdown(md)
+  assert highlight == "hi"
+  assert ocr_body == "annotation"
+
+
+def test_parse_digest_markdown_strips_image_refs_no_body():
+  md = "> hi\n\n![](./123.png)\n"
+  highlight, ocr_body = api._parse_digest_markdown(md)
+  assert highlight == "hi"
+  assert ocr_body is None
+
+
 def test_parse_digest_markdown_roundtrip():
   for hi, ocr_body in [
     ("simple", "ocr text"),
@@ -355,6 +432,15 @@ def test_parse_note_markdown_extracts_per_page():
   md = "## Page 1\n\nfirst page text\n\n## Page 2\n\nsecond page text\n"
   pairs = api._parse_note_markdown(md)
   assert pairs == [(1, "first page text"), (2, "second page text")]
+
+
+def test_parse_note_markdown_strips_image_refs():
+  md = (
+    "## Page 1\n\nfirst\n\n![](dir/page_1.png)\n\n"
+    "## Page 2\n\nsecond\n\n![](dir/page_2.png)\n"
+  )
+  pairs = api._parse_note_markdown(md)
+  assert pairs == [(1, "first"), (2, "second")]
 
 
 def test_parse_note_markdown_roundtrip():

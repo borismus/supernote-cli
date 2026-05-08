@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
 import hashlib
 import os
@@ -17,22 +16,6 @@ from pathlib import Path, PurePosixPath
 from . import ocr as _ocr
 from .client import ApiError, Client
 from .models import Digest, DigestHash, Note
-
-
-@contextlib.contextmanager
-def _workdir(dir: str | os.PathLike | None):
-  """Yield a Path that is either a TemporaryDirectory or the given dir.
-
-  When dir is None, a tempdir is created and cleaned up on exit. Otherwise
-  the given dir is created if needed and left in place.
-  """
-  if dir is None:
-    with tempfile.TemporaryDirectory() as td:
-      yield Path(td)
-  else:
-    p = Path(dir)
-    p.mkdir(parents=True, exist_ok=True)
-    yield p
 
 
 def list_files(client: Client, directory_id: str | int = 0, page_size: int = 500) -> list[Note]:
@@ -426,7 +409,10 @@ def render_handwriting(
   *,
   force: bool = False,
 ) -> list[Path]:
-  """Render a digest's handwriting to `page_N.png` (1-indexed) inside `dir`.
+  """Render a digest's handwriting to `{digest_id}.png` inside `dir`.
+
+  Single-page handwriting is written as `{digest_id}.png`; multi-page is
+  written as `{digest_id}_p{N}.png` (1-indexed).
 
   Returns the full list of page PNG paths (one per rendered page), whether
   newly written or already on disk. Empty list if the digest has no
@@ -456,7 +442,8 @@ def render_handwriting(
 
     paths: list[Path] = []
     for i in range(total):
-      dest = out / f"page_{i + 1}.png"
+      suffix = "" if total == 1 else f"_p{i + 1}"
+      dest = out / f"{digest.id}{suffix}.png"
       paths.append(dest)
       if dest.exists() and not force:
         continue
@@ -634,27 +621,68 @@ def list_notes(
 # ---- Markdown helpers (digest + note) ----
 
 
-def _compose_digest_markdown(highlight: str, ocr_body: str) -> str:
-  """Build digest markdown: blockquoted highlight + optional OCR body."""
+_IMAGE_REF_RE = re.compile(r"^!\[\]\([^)]+\)\s*$")
+NO_TRANSCRIPT_PLACEHOLDER = "_(no transcript)_"
+
+
+def _compose_digest_markdown(
+  highlight: str,
+  ocr_body: str,
+  image_refs: list[str] | None = None,
+) -> str:
+  """Build digest markdown: blockquoted highlight + optional OCR + image refs.
+
+  `image_refs` are markdown-relative paths to handwriting PNGs; each is
+  appended as `![](ref)` after the body (or after the blockquote when
+  there is no body), separated by a blank line.
+  """
   if highlight:
     quoted = "\n".join(f"> {line}" for line in highlight.splitlines())
   else:
     quoted = "> "
+  parts = [quoted]
   if ocr_body:
-    return f"{quoted}\n\n{ocr_body.rstrip()}\n"
-  return f"{quoted}\n"
+    parts.append(ocr_body.rstrip())
+  if image_refs:
+    parts.append("\n".join(f"![]({ref})" for ref in image_refs))
+  return "\n\n".join(parts) + "\n"
 
 
-def _compose_note_markdown(pages: list[NotePage]) -> str:
-  """Build note markdown: one ## Page N section per page."""
+def _compose_note_markdown(
+  pages: list[NotePage],
+  image_refs: list[str] | None = None,
+  *,
+  empty_placeholder: str = "",
+) -> str:
+  """Build note markdown: one ## Page N section per page.
+
+  Prefers Ollama OCR text when present, otherwise falls back to the
+  device transcript. If both are empty and `empty_placeholder` is
+  given, the placeholder is shown in the page body. When `image_refs`
+  is given (parallel to `pages`), each section ends with an
+  `![](ref)` line so the printed markdown points at the rendered PNG.
+  """
   sections = []
-  for p in pages:
-    text = (p.ocr_text or "").rstrip()
-    sections.append(f"## Page {p.index}\n\n{text}\n")
+  for i, p in enumerate(pages):
+    text = ((p.ocr_text or p.transcript) or "").rstrip()
+    if not text and empty_placeholder:
+      text = empty_placeholder
+    body = f"## Page {p.index}\n\n{text}\n"
+    if image_refs and i < len(image_refs) and image_refs[i]:
+      body += f"\n![]({image_refs[i]})\n"
+    sections.append(body)
   return "\n".join(sections) if sections else ""
 
 
 _NOTE_PAGE_HEADER_RE = re.compile(r"^## Page (\d+)\s*$", re.MULTILINE)
+
+
+def _strip_image_refs(text: str) -> str:
+  """Remove trailing markdown image-only lines (and the blank lines around them)."""
+  lines = text.splitlines()
+  while lines and (not lines[-1].strip() or _IMAGE_REF_RE.match(lines[-1])):
+    lines.pop()
+  return "\n".join(lines)
 
 
 def _parse_digest_markdown(md: str) -> tuple[str, str | None]:
@@ -663,7 +691,9 @@ def _parse_digest_markdown(md: str) -> tuple[str, str | None]:
   Returns (highlight, ocr_text_or_None). The highlight is the joined
   content of leading `> `-prefixed lines (newlines preserved); the OCR
   body is everything after the first blank line that follows the
-  blockquote, stripped. Returns ocr=None when no body is present.
+  blockquote, with trailing `![](...)` image lines stripped. Returns
+  ocr=None when no body is present, or when the body is just the
+  no-transcript placeholder.
   """
   lines = md.splitlines()
   quote_lines: list[str] = []
@@ -672,17 +702,20 @@ def _parse_digest_markdown(md: str) -> tuple[str, str | None]:
     quote_lines.append(lines[i][1:].lstrip(" "))
     i += 1
   highlight = "\n".join(quote_lines)
-  # Skip blank separator lines.
   while i < len(lines) and lines[i].strip() == "":
     i += 1
-  body = "\n".join(lines[i:]).strip()
+  body = _strip_image_refs("\n".join(lines[i:])).strip()
+  if body == NO_TRANSCRIPT_PLACEHOLDER:
+    body = ""
   return highlight, (body or None)
 
 
 def _parse_note_markdown(md: str) -> list[tuple[int, str]]:
   """Inverse of _compose_note_markdown.
 
-  Returns [(page_number, ocr_text), ...] in order of appearance.
+  Returns [(page_number, ocr_text), ...] in order of appearance. Trailing
+  `![](...)` image refs in each section are stripped from the OCR text;
+  a body that is exactly the no-transcript placeholder is normalized to "".
   """
   matches = list(_NOTE_PAGE_HEADER_RE.finditer(md))
   out: list[tuple[int, str]] = []
@@ -691,107 +724,252 @@ def _parse_note_markdown(md: str) -> list[tuple[int, str]]:
     body_start = m.end()
     body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(md)
     body = md[body_start:body_end].strip("\n")
-    # Drop the single blank separator after the header.
     if body.startswith("\n"):
       body = body[1:]
-    out.append((page, body.rstrip()))
+    body = _strip_image_refs(body).rstrip()
+    if body == NO_TRANSCRIPT_PLACEHOLDER:
+      body = ""
+    out.append((page, body))
   return out
+
+
+def _digest_output_mode(output: str | os.PathLike) -> tuple[bool, Path]:
+  """Return (is_file_mode, path). File mode if output ends in `.png`."""
+  p = Path(output)
+  return (p.suffix.lower() == ".png", p)
+
+
+def _digest_cache_md_path(output: str | os.PathLike) -> Path:
+  is_file, p = _digest_output_mode(output)
+  return p.with_suffix(".md") if is_file else p / "content.md"
+
+
+def _digest_target_for_render(
+  output: str | os.PathLike, rendered: list[Path], digest_id: str
+) -> tuple[list[Path], list[str]]:
+  """Given render_handwriting's output (`{id}.png`/`{id}_pN.png` in a dir),
+  rename to the user's `output` spec and return (final_paths, image_refs).
+
+  File mode: `output` becomes the single file (or fans to `{stem}_pN.png`).
+  Dir mode: keep `{id}.png` / `{id}_pN.png` naming inside `output`.
+  """
+  is_file, p = _digest_output_mode(output)
+  output_str = str(output)
+  n = len(rendered)
+  finals: list[Path] = []
+  refs: list[str] = []
+  if is_file:
+    parent = p.parent
+    stem = p.stem
+    for i, src in enumerate(rendered):
+      target = p if (n == 1 and i == 0) else parent / f"{stem}_p{i + 1}.png"
+      finals.append(target)
+      ref_parent = output_str[: -len(p.name)]
+      refs.append(output_str if (n == 1 and i == 0) else f"{ref_parent}{stem}_p{i + 1}.png")
+  else:
+    prefix = output_str.rstrip("/") + "/"
+    for src in rendered:
+      finals.append(p / src.name)
+      refs.append(f"{prefix}{src.name}")
+  return finals, refs
 
 
 def render_digest_markdown(
   client: Client,
   digest: Digest,
+  output: str | os.PathLike | None = None,
   *,
   ocr_model: str = _ocr.DEFAULT_MODEL,
-  no_ocr: bool = False,
+  ocr_engine: str = "supernote",
   force: bool = False,
-  dir: str | os.PathLike | None = None,
   extra_prompt: str | None = None,
   on_page_start: Callable[[int, int], None] | None = None,
   on_token: Callable[[str], None] | None = None,
 ) -> str:
   """Build the stdout-equivalent markdown for a digest.
 
-  Format: blockquoted highlight + (when handwriting exists and `no_ocr` is
-  False) the OCR text below, separated by a blank line.
+  When `output` is None, no PNG persists — the blockquote is the only
+  text output, and Ollama (if engaged via `ocr_engine="ollama"`) runs
+  against a tempdir-rendered PNG that is then discarded.
 
-  When `dir` is given, `page_N.png` and `content.md` are persisted there;
-  on re-run, a cached `content.md` is returned unless `force=True`. When
-  `dir` is None, work happens in a tempdir that's discarded.
+  When `output` is given:
+    - ending in `.png`: single PNG written to that path; multi-page
+      fan-out is `{stem}_p{N}.png` next to it.
+    - otherwise: directory; PNGs written as `{digest_id}.png` /
+      `{digest_id}_p{N}.png` inside.
+    The returned markdown includes `![](...)` image refs pointing at
+    the persisted file(s). With `ocr_engine="ollama"`, `content.md`
+    is also written next to the PNG(s) (or as `{stem}.md` in file
+    mode) as a cache marker.
 
-  The cache key is content.md alone — it does not track `extra_prompt`.
-  Pass `force=True` if you change the prompt and want to invalidate.
+  `ocr_engine`:
+    - "supernote" (default): no annotation transcription (Supernote's
+      device OCR doesn't cover digest handwriting). When `output` is
+      set and handwriting exists, the body shows `_(no transcript)_`
+      next to the image; without `output`, no placeholder is shown.
+    - "ollama": runs Ollama vision OCR on the PNG(s).
 
   Progress callbacks (both optional) — same shape as ocr_note.
   """
-  if dir is not None and not force:
-    cached = Path(dir) / "content.md"
-    if cached.exists():
-      return cached.read_text()
+  use_ollama = ocr_engine == "ollama"
+  has_hw = digest.has_annotation
+  needs_pngs = has_hw and (output is not None or use_ollama)
+
+  if output is not None and use_ollama and not force:
+    cache_md = _digest_cache_md_path(output)
+    if cache_md.exists():
+      return cache_md.read_text()
 
   ocr_body = ""
-  # Render PNGs whenever there's handwriting AND either --dir wants
-  # persistence or we'll OCR them. Skip work entirely if neither applies.
-  if digest.has_annotation and (dir is not None or not no_ocr):
-    with _workdir(dir) as work:
-      pages = render_handwriting(client, digest, work, force=force)
-      if not no_ocr:
-        total = len(pages)
-        parts: list[str] = []
-        for i, p in enumerate(pages):
-          if on_page_start:
-            on_page_start(i + 1, total)
-          parts.append(
-            _ocr.ocr_image(
-              p, model=ocr_model, extra_prompt=extra_prompt, on_token=on_token
-            )
-            or ""
+  image_refs: list[str] = []
+
+  if needs_pngs:
+    if output is None:
+      with tempfile.TemporaryDirectory() as td:
+        rendered = render_handwriting(client, digest, td, force=force)
+        if use_ollama:
+          ocr_body = _run_ollama_on_pages(
+            rendered, ocr_model, extra_prompt, on_page_start, on_token
           )
-        ocr_body = "\n\n".join(part for part in parts if part)
+    else:
+      is_file, p = _digest_output_mode(output)
+      work_dir = p.parent if is_file else p
+      work_dir.mkdir(parents=True, exist_ok=True)
+      rendered = render_handwriting(client, digest, work_dir, force=force)
+      finals, image_refs = _digest_target_for_render(output, rendered, digest.id)
+      _rename_to_targets(rendered, finals, force=force)
+      if use_ollama:
+        ocr_body = _run_ollama_on_pages(
+          finals, ocr_model, extra_prompt, on_page_start, on_token
+        )
 
-  md = _compose_digest_markdown(digest.content or "", ocr_body)
+  if image_refs and not ocr_body and has_hw:
+    ocr_body = NO_TRANSCRIPT_PLACEHOLDER
 
-  if dir is not None:
-    out = Path(dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "content.md").write_text(md)
+  md = _compose_digest_markdown(digest.content or "", ocr_body, image_refs)
+
+  if output is not None and use_ollama:
+    cache_md = _digest_cache_md_path(output)
+    cache_md.parent.mkdir(parents=True, exist_ok=True)
+    cache_md.write_text(md)
+
   return md
+
+
+def _run_ollama_on_pages(
+  paths: list[Path],
+  model: str,
+  extra_prompt: str | None,
+  on_page_start: Callable[[int, int], None] | None,
+  on_token: Callable[[str], None] | None,
+) -> str:
+  """Run Ollama OCR on each PNG; return joined non-empty results, or the
+  no-transcript placeholder if every page came back empty."""
+  total = len(paths)
+  parts: list[str] = []
+  for i, p in enumerate(paths):
+    if on_page_start:
+      on_page_start(i + 1, total)
+    parts.append(
+      _ocr.ocr_image(
+        p, model=model, extra_prompt=extra_prompt, on_token=on_token
+      )
+      or ""
+    )
+  body = "\n\n".join(part for part in parts if part)
+  return body or NO_TRANSCRIPT_PLACEHOLDER
+
+
+def _rename_to_targets(rendered: list[Path], targets: list[Path], *, force: bool) -> None:
+  """Move/rename freshly-rendered PNGs to their target paths.
+
+  When the target exists and `force` is False, the source is removed
+  (treating the existing target as the source-of-truth cached output).
+  """
+  for src, dst in zip(rendered, targets):
+    if src == dst:
+      continue
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+      if force:
+        dst.unlink()
+      else:
+        src.unlink(missing_ok=True)
+        continue
+    src.rename(dst)
 
 
 def render_note_markdown(
   client: Client,
   file_id: str | int,
+  output: str | os.PathLike | None = None,
   *,
   ocr_model: str = _ocr.DEFAULT_MODEL,
-  no_ocr: bool = False,
+  ocr_engine: str = "supernote",
   force: bool = False,
-  dir: str | os.PathLike | None = None,
   extra_prompt: str | None = None,
   on_page_start: Callable[[int, int], None] | None = None,
   on_token: Callable[[str], None] | None = None,
 ) -> str:
   """Build the stdout-equivalent markdown for a cloud `.note` file.
 
-  Format: `## Page N\\n\\n{ocr text}\\n` per page, concatenated.
+  When `output` is None, no PNGs persist. The text comes from the
+  device transcript per page (or Ollama OCR if `ocr_engine="ollama"`,
+  which renders to a tempdir, OCRs, and discards). Pages with no
+  transcript render as `_(no transcript)_`.
 
-  When `dir` is given, `page_N.png` + `content.md` are persisted there;
-  on re-run, the cached `content.md` is returned unless `force=True`.
-  The cache does not track `extra_prompt` — pass `force=True` to
-  re-OCR with a changed prompt.
-
-  Progress callbacks (both optional) — same shape as ocr_note.
+  When `output` (a directory) is given, `page_{N}.png` files are
+  written into it and the returned markdown includes per-page
+  `![](output/page_N.png)` refs. With `ocr_engine="ollama"`,
+  `content.md` is written into `output` as a cache marker.
   """
-  if dir is not None and not force:
-    cached = Path(dir) / "content.md"
+  use_ollama = ocr_engine == "ollama"
+
+  if output is not None and use_ollama and not force:
+    cached = Path(output) / "content.md"
     if cached.exists():
       return cached.read_text()
 
-  with _workdir(dir) as work:
-    if no_ocr:
-      # Render PNGs only (no OCR call); build NotePage list with empty ocr_text.
+  pages: list[NotePage]
+  image_refs: list[str] = []
+
+  if output is None and not use_ollama:
+    # Lightest path: just download .note, extract transcripts. No PNGs.
+    with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
+      download_file(client, file_id, Path(tmp.name))
+      transcripts = extract_note_text(tmp.name)
+    pages = [
+      NotePage(
+        index=i + 1,
+        png_path=Path(""),
+        transcript=t or None,
+        ocr_text=None,
+      )
+      for i, t in enumerate(transcripts)
+    ]
+  elif output is None and use_ollama:
+    # OCR path without persistence: render to tempdir, OCR, discard.
+    with tempfile.TemporaryDirectory() as td:
+      tdp = Path(td)
+      pages = ocr_note_from_cloud(
+        client, file_id, tdp,
+        model=ocr_model, force=force, extra_prompt=extra_prompt,
+        on_page_start=on_page_start, on_token=on_token,
+      )
+  else:
+    # Output given: persist PNGs.
+    out = Path(output)
+    out.mkdir(parents=True, exist_ok=True)
+    if use_ollama:
+      pages = ocr_note_from_cloud(
+        client, file_id, out,
+        model=ocr_model, force=force, extra_prompt=extra_prompt,
+        on_page_start=on_page_start, on_token=on_token,
+      )
+    else:
       with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
         download_file(client, file_id, Path(tmp.name))
-        png_paths = render_note(tmp.name, work, force=force)
+        png_paths = render_note(tmp.name, out, force=force)
         transcripts = extract_note_text(tmp.name)
       pages = [
         NotePage(
@@ -802,17 +980,11 @@ def render_note_markdown(
         )
         for i, png in enumerate(png_paths)
       ]
-    else:
-      pages = ocr_note_from_cloud(
-        client, file_id, work,
-        model=ocr_model, force=force, extra_prompt=extra_prompt,
-        on_page_start=on_page_start, on_token=on_token,
-      )
+    prefix = str(output).rstrip("/") + "/"
+    image_refs = [f"{prefix}{p.png_path.name}" for p in pages]
 
-  md = _compose_note_markdown(pages)
+  md = _compose_note_markdown(pages, image_refs, empty_placeholder=NO_TRANSCRIPT_PLACEHOLDER)
 
-  if dir is not None:
-    out = Path(dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "content.md").write_text(md)
+  if output is not None and use_ollama:
+    (Path(output) / "content.md").write_text(md)
   return md
