@@ -229,8 +229,8 @@ def test_19_cli_ls():
   assert "Note" in r.stdout
 
 
-def test_20_cli_digest_ls():
-  r = _run_cli("digest", "ls", "--limit", "2")
+def test_20_cli_annotation_ls():
+  r = _run_cli("annotation", "ls", "--limit", "2")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   assert r.stdout.count("\n") >= 1
 
@@ -240,8 +240,8 @@ def test_21_cli_sync_dry_run(tmp_path):
   assert r.returncode == 0, f"stderr: {r.stderr}"
 
 
-def test_22_cli_digest_ls_json():
-  r = _run_cli("digest", "ls", "--limit", "2", "--json")
+def test_22_cli_annotation_ls_json():
+  r = _run_cli("annotation", "ls", "--limit", "2", "--json")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert isinstance(data, list)
@@ -319,83 +319,85 @@ def test_26_render_handwriting_force_rewrites(client: Client, tmp_path: Path):
     assert p.stat().st_mtime_ns >= mt
 
 
-def test_27_cli_digest_markdown_default(client: Client, tmp_path: Path):
-  """Default (no --json, no --dir): markdown to stdout, nothing on disk."""
+def test_27_cli_annotation_markdown_default(client: Client, tmp_path: Path):
+  """Default (no flags): blockquote markdown to stdout, no OCR, nothing on disk."""
   d = _first_digest_with_annotation(client)
-  r = _run_cli("digest", d.id, "--no-ocr", cwd=tmp_path)
+  r = _run_cli("annotation", d.id, cwd=tmp_path)
   assert r.returncode == 0, f"stderr: {r.stderr}"
   assert r.stdout.startswith(">") or "\n>" in r.stdout
   assert list(tmp_path.iterdir()) == []
 
 
-def test_28_cli_digest_no_handwriting(client: Client, tmp_path: Path):
+def test_28_cli_annotation_no_handwriting(client: Client, tmp_path: Path):
   """A digest without handwriting produces just the blockquote in markdown."""
   d = _first_digest_without_annotation(client)
-  r = _run_cli("digest", d.id, cwd=tmp_path)
+  r = _run_cli("annotation", d.id, cwd=tmp_path)
   assert r.returncode == 0, f"stderr: {r.stderr}"
   non_quote_lines = [ln for ln in r.stdout.splitlines() if ln.strip() and not ln.startswith(">")]
   assert non_quote_lines == [], f"unexpected non-quote lines: {non_quote_lines}"
 
 
-def test_29_cli_digest_dir_writes_content_and_pages(client: Client, tmp_path: Path):
+def test_29_cli_annotation_dir_writes_id_keyed_png(client: Client, tmp_path: Path):
+  """`-o DIR` (default --ocr none) writes the ID-keyed PNG only — no cache md
+  (cache md is gated on --ocr ollama)."""
   d = _first_digest_with_annotation(client)
   out = tmp_path / "d"
-  r = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out))
+  r = _run_cli("annotation", d.id, "-o", str(out))
   assert r.returncode == 0, f"stderr: {r.stderr}"
-  assert (out / "content.md").exists()
-  assert (out / "page_1.png").exists()
-  cm = (out / "content.md").read_text()
-  cm_norm = cm if cm.endswith("\n") else cm + "\n"
-  stdout_norm = r.stdout if r.stdout.endswith("\n") else r.stdout + "\n"
-  assert cm_norm == stdout_norm
+  assert (out / f"{d.id}.png").exists()
+  assert not (out / f"{d.id}.md").exists()  # no cache md without ollama
 
 
-def test_30_cli_digest_dir_cache_hit(client: Client, tmp_path: Path):
+def test_30_cli_annotation_dir_cache_hit(client: Client, tmp_path: Path):
+  """Re-running with the same -o DIR doesn't re-render the PNG (existence skip)."""
   d = _first_digest_with_annotation(client)
   out = tmp_path / "d"
-  r1 = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out))
+  r1 = _run_cli("annotation", d.id, "-o", str(out))
   assert r1.returncode == 0
-  m1 = (out / "page_1.png").stat().st_mtime_ns
+  m1 = (out / f"{d.id}.png").stat().st_mtime_ns
   import time as _time
 
   _time.sleep(0.01)
-  r2 = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out))
+  r2 = _run_cli("annotation", d.id, "-o", str(out))
   assert r2.returncode == 0
   assert r2.stdout == r1.stdout
   # PNG should not have been re-written
-  assert (out / "page_1.png").stat().st_mtime_ns == m1
+  assert (out / f"{d.id}.png").stat().st_mtime_ns == m1
 
 
-def test_31_cli_digest_json_shape(client: Client, tmp_path: Path):
+def test_31_cli_annotation_json_shape(client: Client, tmp_path: Path):
   """--json emits the v0.2 JSON shape using Supernote terminology."""
   d = _first_digest_with_annotation(client)
   out = tmp_path / "d"
-  r = _run_cli("digest", d.id, "--no-ocr", "--dir", str(out), "--json")
+  r = _run_cli("annotation", d.id, "-o", str(out), "--json")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert data["id"] == d.id
   assert "digest" in data
-  assert data["annotation"] is None  # --no-ocr
-  assert data["handwritten_image"] == "page_1.png"
+  assert data["annotation"] is None  # default --ocr none
+  assert data["handwritten_image"] == f"{out}/{d.id}.png"
   assert "source_path" in data
   assert "last_modified" in data
 
 
-def test_32_cli_digest_json_no_dir_image_null(client: Client, tmp_path: Path):
-  """--json without --dir: handwritten_image is null (no files persisted)."""
+def test_32_cli_annotation_json_no_dir_image_null(client: Client, tmp_path: Path):
+  """--json without -o: handwritten_image is null (no files persisted)."""
   d = _first_digest_with_annotation(client)
-  r = _run_cli("digest", d.id, "--no-ocr", "--json", cwd=tmp_path)
+  r = _run_cli("annotation", d.id, "--json", cwd=tmp_path)
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert data["handwritten_image"] is None
   assert list(tmp_path.iterdir()) == []
 
 
-def test_33_cli_digest_multi_id_with_dir_errors(client: Client, tmp_path: Path):
+def test_33_cli_annotation_multi_id_with_dir_errors(client: Client, tmp_path: Path):
+  """Multi-id with -o DIR --ocr still errors (multi-id is out of scope)."""
   d = _first_digest_with_annotation(client)
-  r = _run_cli("digest", f"{d.id},{d.id}", "--dir", str(tmp_path / "x"), "--no-ocr")
+  r = _run_cli(
+    "annotation", f"{d.id},{d.id}", "-o", str(tmp_path / "x"), "--ocr"
+  )
   assert r.returncode != 0
-  assert "single" in r.stderr.lower() or "per-digest" in r.stderr.lower()
+  assert "single" in r.stderr.lower() or "multi-id" in r.stderr.lower()
 
 
 # ---------- Sources ----------
@@ -544,8 +546,8 @@ def test_43_ocr_note_from_cloud(client, tmp_path):
     assert p.png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_44_cli_note_ls_json(client):
-  r = _run_cli("note", "ls", "--limit", "3", "--json")
+def test_44_cli_notebook_ls_json(client):
+  r = _run_cli("notebook", "ls", "--limit", "3", "--json")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert isinstance(data, list)
@@ -555,48 +557,47 @@ def test_44_cli_note_ls_json(client):
     assert entry["file_name"].endswith(".note")
 
 
-def test_45_cli_note_markdown_default(client, tmp_path):
-  """Default (no --json, no --dir): markdown to stdout, nothing on disk."""
+def test_45_cli_notebook_markdown_default(client, tmp_path):
+  """Default (no --json, no -o, default --ocr supernote): per-page transcript
+  markdown to stdout, nothing on disk."""
   file_id = _smallest_cloud_note_id(client)
-  r = _run_cli("note", file_id, "--no-ocr", cwd=tmp_path)
+  r = _run_cli("notebook", file_id, cwd=tmp_path)
   assert r.returncode == 0, f"stderr: {r.stderr}"
   assert "## Page 1" in r.stdout
   assert list(tmp_path.iterdir()) == []
 
 
-def test_45a_cli_note_dir_writes_content_and_pages(client, tmp_path):
+def test_45a_cli_notebook_dir_writes_pages(client, tmp_path):
+  """`notebook <id> -o DIR` writes page_N.png. With default --ocr supernote
+  (non-Ollama) no content.md is written."""
   file_id = _smallest_cloud_note_id(client)
   out = tmp_path / "n"
-  r = _run_cli("note", file_id, "--no-ocr", "--dir", str(out))
+  r = _run_cli("notebook", file_id, "-o", str(out))
   assert r.returncode == 0, f"stderr: {r.stderr}"
-  assert (out / "content.md").exists()
   assert (out / "page_1.png").exists()
-  cm = (out / "content.md").read_text()
-  cm_norm = cm if cm.endswith("\n") else cm + "\n"
-  stdout_norm = r.stdout if r.stdout.endswith("\n") else r.stdout + "\n"
-  assert cm_norm == stdout_norm
+  assert not (out / "content.md").exists()  # no cache md without ollama
 
 
-def test_45b_cli_note_dir_cache_hit(client, tmp_path):
+def test_45b_cli_notebook_dir_cache_hit(client, tmp_path):
   file_id = _smallest_cloud_note_id(client)
   out = tmp_path / "n"
-  r1 = _run_cli("note", file_id, "--no-ocr", "--dir", str(out))
+  r1 = _run_cli("notebook", file_id, "-o", str(out))
   assert r1.returncode == 0
   m1 = (out / "page_1.png").stat().st_mtime_ns
   import time as _time
 
   _time.sleep(0.01)
-  r2 = _run_cli("note", file_id, "--no-ocr", "--dir", str(out))
+  r2 = _run_cli("notebook", file_id, "-o", str(out))
   assert r2.returncode == 0
   assert r2.stdout == r1.stdout
   assert (out / "page_1.png").stat().st_mtime_ns == m1
 
 
-def test_45c_cli_note_json_shape(client, tmp_path):
-  """`note <id> --json --dir DIR` emits v0.2 per-page JSON with page_N.png paths."""
+def test_45c_cli_notebook_json_shape(client, tmp_path):
+  """`notebook <id> -o DIR --json` emits v0.2 per-page JSON with full path image refs."""
   file_id = _smallest_cloud_note_id(client)
   out = tmp_path / "n"
-  r = _run_cli("note", file_id, "--no-ocr", "--dir", str(out), "--json")
+  r = _run_cli("notebook", file_id, "-o", str(out), "--json")
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   assert isinstance(data, list)
@@ -604,14 +605,14 @@ def test_45c_cli_note_json_shape(client, tmp_path):
   for entry in data:
     assert set(entry) == {"page", "transcript", "annotation", "handwritten_image"}
     assert entry["annotation"] is None
-    assert entry["handwritten_image"] == f"page_{entry['page']}.png"
-    assert (out / entry["handwritten_image"]).exists()
+    assert entry["handwritten_image"] == f"{out}/page_{entry['page']}.png"
+    assert (Path(entry["handwritten_image"])).exists()
 
 
-def test_45d_cli_note_json_no_dir_image_null(client, tmp_path):
-  """--json without --dir: handwritten_image is null (no persistence)."""
+def test_45d_cli_notebook_json_no_dir_image_null(client, tmp_path):
+  """--json without -o: handwritten_image is null (no persistence)."""
   file_id = _smallest_cloud_note_id(client)
-  r = _run_cli("note", file_id, "--no-ocr", "--json", cwd=tmp_path)
+  r = _run_cli("notebook", file_id, "--json", cwd=tmp_path)
   assert r.returncode == 0, f"stderr: {r.stderr}"
   data = json.loads(r.stdout)
   for entry in data:

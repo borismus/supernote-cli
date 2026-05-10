@@ -16,6 +16,17 @@ from . import api, ocr, tokenstore
 from .client import ApiError, AuthRequired, Client
 
 
+def _ls_format_time(d: dt.datetime, now: dt.datetime | None = None) -> str:
+  """Format mtime like macOS `ls -l`: `Mon DD HH:MM` when within ~6 months,
+  `Mon DD  YYYY` otherwise. Uses local time (the api's datetime objects come
+  from `datetime.fromtimestamp(...)` so they're already in local tz)."""
+  if now is None:
+    now = dt.datetime.now()
+  if abs((now - d).days) < 180:
+    return d.strftime("%b %e %H:%M")
+  return d.strftime("%b %e  %Y")
+
+
 class _Marquee:
   """Two-line OCR progress display on stderr:
 
@@ -166,91 +177,101 @@ def _build_parser() -> argparse.ArgumentParser:
   src = sub.add_parser(
     "source",
     help="source-document commands",
-    description="Run `source ls` to list source documents that have digests.",
+    description="Run `source ls` to list source documents that have annotations.",
   )
   src.add_argument("target", help="'ls' (the only subcommand today)")
   src.add_argument("--days-ago", dest="days_ago", type=int)
   src.add_argument("--limit", type=int, default=50)
   src.add_argument("--json", dest="as_json", action="store_true")
 
-  dg = sub.add_parser(
-    "digest",
-    help="digest (highlight + annotation) commands",
+  an = sub.add_parser(
+    "annotation",
+    aliases=("an",),
+    help="annotation (highlight + handwriting) commands",
     description=(
-      "Run `digest ls` to list digest summary records. With one or more "
-      "comma-separated digest IDs, print the blockquoted highlight to "
-      "stdout. Pass `-o PATH` to also persist the handwriting PNG "
-      "(file or dir); pass `--ocr ollama` to also transcribe the "
-      "handwriting via local Ollama vision OCR."
+      "Run `annotation ls` to list annotation records. With an ID, "
+      "print the blockquoted highlight to stdout. Pass `--ocr` to also "
+      "transcribe the handwriting via local Ollama vision OCR. Pass "
+      "`-o PATH` to persist the handwriting PNG (and, with `--ocr`, "
+      "a cache markdown) alongside."
     ),
   )
-  dg.add_argument("target", help="'ls' to list, or digest id(s) comma-separated")
+  an.add_argument("target", help="'ls' to list, or annotation id(s) comma-separated")
   # ls
-  dg.add_argument("--limit", type=int, default=20, help="(ls only) max records to list")
-  dg.add_argument("--days-ago", dest="days_ago", type=int, help="(ls only) only include digests modified within N days")
+  an.add_argument("--limit", type=int, default=20, help="(ls only) max records to list")
+  an.add_argument("--days-ago", dest="days_ago", type=int, help="(ls only) only include annotations modified within N days")
   # both
-  dg.add_argument(
+  an.add_argument(
     "--json",
     dest="as_json",
     action="store_true",
     help="emit JSON instead of markdown (id form) / table (ls form)",
   )
   # <id>
-  dg.add_argument(
+  an.add_argument(
     "-o", "--output",
     dest="output",
     default=None,
-    help="(id form) write the handwriting PNG. Path ending in .png is a file path (single PNG; multi-page fans to {stem}_pN.png); otherwise a directory ({digest_id}.png inside). Default: no PNG persisted.",
+    help=(
+      "(id form) write the handwriting PNG and a cache markdown alongside. "
+      "Path ending in .png: file mode (single PNG at PATH; multi-page fans "
+      "to {stem}_pN.png; cache md at PATH with .md suffix). Otherwise: dir "
+      "mode (PNG at PATH/{annotation_id}.png; cache md at PATH/{annotation_id}.md). "
+      "Default: no files persisted."
+    ),
   )
-  dg.add_argument(
+  an.add_argument(
     "--ocr",
     dest="ocr",
-    choices=("supernote", "ollama"),
-    default="supernote",
-    help="(id form) handwriting transcription engine. 'supernote' (default): no annotation transcript (Supernote's device OCR doesn't cover digest handwriting; the markdown shows '_(no transcript)_'). 'ollama': run local Ollama vision OCR.",
+    action="store_true",
+    help=(
+      "(id form) transcribe the handwriting via local Ollama vision OCR. "
+      "Default off — markdown body has just the blockquote."
+    ),
   )
-  dg.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr ollama) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
-  dg.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
-  dg.add_argument("--prompt", dest="prompt", help="(id form, with --ocr ollama) extra OCR instructions appended to the default prompt")
+  an.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  an.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
+  an.add_argument("--prompt", dest="prompt", help="(id form, with --ocr) extra OCR instructions appended to the default prompt")
 
-  nt = sub.add_parser(
-    "note",
-    help=".note file commands",
+  nb = sub.add_parser(
+    "notebook",
+    aliases=("nb",),
+    help="notebook (.note file) commands",
     description=(
-      "Run `note ls` to list .note files under /Note/. With a numeric file id, "
-      "print the device-OCR transcript per page. Pass `-o DIR` to also "
-      "persist `page_N.png`; pass `--ocr ollama` to swap the device "
+      "Run `notebook ls` to list .note files under /Note/. With a numeric "
+      "file id, print the device-OCR transcript per page. Pass `-o DIR` to "
+      "also persist `page_N.png`; pass `--ocr ollama` to swap the device "
       "transcript for Ollama vision OCR."
     ),
   )
-  nt.add_argument("target", help="'ls' to list .note files, or a target to fetch: basename (foo.note or foo), full path (Note/sub/foo.note), or numeric file id")
+  nb.add_argument("target", help="'ls' to list notebooks, or a target to fetch: numeric file id (recommended), basename (foo.note or foo), or full path (Note/sub/foo.note)")
   # ls
-  nt.add_argument("--limit", type=int, default=50, help="(ls only) max records to list")
-  nt.add_argument("--days-ago", dest="days_ago", type=int, help="(ls only) only include files modified within N days")
+  nb.add_argument("--limit", type=int, default=50, help="(ls only) max records to list")
+  nb.add_argument("--days-ago", dest="days_ago", type=int, help="(ls only) only include files modified within N days")
   # both
-  nt.add_argument(
+  nb.add_argument(
     "--json",
     dest="as_json",
     action="store_true",
     help="emit JSON instead of markdown (id form) / table (ls form)",
   )
   # <id>
-  nt.add_argument(
+  nb.add_argument(
     "-o", "--output",
     dest="output",
     default=None,
     help="(id form) directory to write page_N.png (and content.md when --ocr ollama). Default: no PNGs persisted, transcripts only.",
   )
-  nt.add_argument(
+  nb.add_argument(
     "--ocr",
     dest="ocr",
     choices=("supernote", "ollama"),
     default="supernote",
     help="(id form) handwriting transcription engine. 'supernote' (default): use the device's on-tablet OCR transcript per page (pages with no transcript show '_(no transcript)_'). 'ollama': run local Ollama vision OCR per page.",
   )
-  nt.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr ollama) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
-  nt.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
-  nt.add_argument("--prompt", dest="prompt", help="(id form, with --ocr ollama) extra OCR instructions appended to the default prompt")
+  nb.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr ollama) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  nb.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
+  nb.add_argument("--prompt", dest="prompt", help="(id form, with --ocr ollama) extra OCR instructions appended to the default prompt")
 
   return p
 
@@ -299,8 +320,8 @@ def _cmd_ls(args) -> int:
   for n in contents:
     kind = "d" if n.is_folder else "-"
     size = "" if n.is_folder else f"{n.size:>10}"
-    mtime = n.update_time.strftime("%Y-%m-%d %H:%M")
-    print(f"{kind} {size:>10}  {mtime}  {n.id:>20}  {n.file_name}")
+    mtime = _ls_format_time(n.update_time)
+    print(f" {kind} {size:>10}  {mtime}  {n.id}  {n.file_name}")
   return 0
 
 
@@ -408,20 +429,20 @@ def _cmd_source(args) -> int:
     print(json.dumps([_source_summary_dict(s) for s in sources], indent=2))
     return 0
   if not sources:
-    print("(no digested sources)")
+    print("(no sources with annotations)")
     return 0
   for s in sources:
-    print(f"{len(s.digests):>4}  {s.latest_modified.strftime('%Y-%m-%d')}  {s.source_path}")
+    print(f" {len(s.digests):>4}  {_ls_format_time(s.latest_modified)}  {s.source_path}")
   return 0
 
 
-def _cmd_digest(args) -> int:
+def _cmd_annotation(args) -> int:
   if args.target == "ls":
-    return _digest_ls(args)
-  return _digest_show(args)
+    return _annotation_ls(args)
+  return _annotation_show(args)
 
 
-def _digest_ls(args) -> int:
+def _annotation_ls(args) -> int:
   c = _client_from_args(args)
   hashes = api.fetch_digest_hashes(c, size=max(args.limit, 500))
   if args.days_ago is not None:
@@ -432,43 +453,74 @@ def _digest_ls(args) -> int:
     print(json.dumps([_digest_hash_dict(h) for h in hashes], indent=2))
     return 0
   if not hashes:
-    print("(no digests)")
+    print("(no annotations)")
     return 0
   ids = [h.id for h in hashes]
   full = {d.id: d for d in api.fetch_digests_by_ids(c, ids)}
+
+  # Group by source so the source filename only prints once per group.
+  by_src: dict[str, list[tuple]] = {}
   for h in hashes:
     d = full.get(h.id)
-    preview = ""
-    src = ""
-    if d:
-      preview = (d.content or "").replace("\n", " ")[:80]
-      src = d.source_path or ""
-    print(f"{h.id:>20}  {src}  | {preview}")
+    if d is None:
+      continue
+    src = d.source_path or ""
+    by_src.setdefault(src, []).append((h, d))
+
+  # Sources sorted by most-recent activity, oldest-first so the freshest
+  # source group lands at the bottom (latest entry just above the prompt —
+  # matches notebook ls).
+  src_order = sorted(
+    by_src,
+    key=lambda s: max(h.last_modified for h, _ in by_src[s]),
+  )
+
+  cols, _ = shutil.get_terminal_size((80, 20))
+  # ` (A)` is appended on rows whose digest has handwriting on top, so the
+  # eye can scan for which entries have an extra layer to pull. Reserve the
+  # 4-char width on every row so the marker (when present) always lands at
+  # the same column.
+  marker_w = 4
+  for i, src in enumerate(src_order):
+    if i > 0:
+      print()
+    doc = src.rsplit("/", 1)[-1] if src else "(unknown source)"
+    print(doc)
+    items = sorted(by_src[src], key=lambda hd: hd[0].last_modified)
+    for h, d in items:
+      mtime = _ls_format_time(h.last_modified)
+      prefix = f" {h.id}  {mtime}  "
+      # Reserve marker_w for the trailing marker + 1 col for right margin.
+      available = max(20, cols - len(prefix) - marker_w - 1)
+      preview = (d.content or "").replace("\n", " ")[:available]
+      marker = " (A)" if d.has_annotation else ""
+      print(f"{prefix}{preview.ljust(available)}{marker}")
   return 0
 
 
-def _digest_show(args) -> int:
+def _annotation_show(args) -> int:
   c = _client_from_args(args)
   ids = [i.strip() for i in args.target.split(",") if i.strip()]
-  use_ollama = args.ocr == "ollama"
+  use_ollama = bool(args.ocr)
+  ocr_engine = "ollama" if use_ollama else "none"
 
   if args.output is not None and len(ids) > 1:
     is_file_mode = args.output.lower().endswith(".png")
     if is_file_mode:
       print(
-        "error: -o file.png is single-id; pass a single digest id or use a directory",
+        "error: -o file.png is single-id; pass a single annotation id or use a directory",
         file=sys.stderr,
       )
       return 2
     if use_ollama:
       print(
-        "error: -o with --ocr ollama is per-digest (content.md collides); pass a single id",
+        "error: multi-id with -o --ocr is unsupported; pass a single annotation id",
         file=sys.stderr,
       )
       return 2
 
   if args.prompt and not use_ollama:
-    print("warning: --prompt has no effect without --ocr ollama", file=sys.stderr)
+    print("warning: --prompt has no effect without --ocr", file=sys.stderr)
 
   if use_ollama:
     try:
@@ -485,9 +537,9 @@ def _digest_show(args) -> int:
     for did in ids:
       d = by_id.get(did)
       if d is None:
-        print(f"warning: digest {did} not found", file=sys.stderr)
+        print(f"warning: annotation {did} not found", file=sys.stderr)
         continue
-      records.append(_digest_json_record(c, d, args))
+      records.append(_annotation_json_record(c, d, args))
     print(json.dumps(records[0] if len(records) == 1 else records, indent=2))
     return 0
 
@@ -497,12 +549,12 @@ def _digest_show(args) -> int:
     for i, did in enumerate(ids):
       d = by_id.get(did)
       if d is None:
-        print(f"warning: digest {did} not found", file=sys.stderr)
+        print(f"warning: annotation {did} not found", file=sys.stderr)
         continue
       md = api.render_digest_markdown(
         c, d, args.output,
         ocr_model=args.model,
-        ocr_engine=args.ocr,
+        ocr_engine=ocr_engine,
         force=args.force,
         extra_prompt=args.prompt,
         on_page_start=marquee.page,
@@ -513,11 +565,11 @@ def _digest_show(args) -> int:
       sys.stdout.write(md)
       if not md.endswith("\n"):
         sys.stdout.write("\n")
-      # Surface untranscribed-handwriting hint when nothing pulls it.
+      # Surface untranscribed-digest hint when nothing pulls it.
       if d.has_annotation and args.output is None and not use_ollama:
         print(
-          f"note: digest {d.id} has untranscribed handwriting; "
-          "pass --ocr ollama to transcribe (or -o PATH to save the PNG)",
+          f"\nNote: annotation {d.id} has untranscribed digest; "
+          "pass --ocr to transcribe (or -o PATH to save the PNG)",
           file=sys.stderr,
         )
   finally:
@@ -525,14 +577,14 @@ def _digest_show(args) -> int:
   return 0
 
 
-def _digest_json_record(c, digest, args) -> dict:
+def _annotation_json_record(c, digest, args) -> dict:
   """Build a v0.2-shaped JSON record for a digest."""
   marquee = _Marquee()
   try:
     md = api.render_digest_markdown(
       c, digest, args.output,
       ocr_model=args.model,
-      ocr_engine=args.ocr,
+      ocr_engine="ollama" if args.ocr else "none",
       force=args.force,
       extra_prompt=args.prompt,
       on_page_start=marquee.page,
@@ -552,13 +604,13 @@ def _digest_json_record(c, digest, args) -> dict:
   }
 
   if digest.has_annotation and args.output is not None:
-    rels = _list_digest_image_refs(args.output, digest.id)
+    rels = _list_annotation_image_refs(args.output, digest.id)
     if rels:
       rec["handwritten_image"] = rels[0] if len(rels) == 1 else rels
   return rec
 
 
-def _list_digest_image_refs(output: str, digest_id: str) -> list[str]:
+def _list_annotation_image_refs(output: str, digest_id: str) -> list[str]:
   """Enumerate the on-disk PNGs the digest produced under `-o`, returning
   refs as they should appear in the markdown / JSON output."""
   is_file = output.lower().endswith(".png")
@@ -597,13 +649,13 @@ def _list_page_pngs(dir: Path) -> list[str]:
   return out
 
 
-def _cmd_note(args) -> int:
+def _cmd_notebook(args) -> int:
   if args.target == "ls":
-    return _note_ls(args)
-  return _note_show(args)
+    return _notebook_ls(args)
+  return _notebook_show(args)
 
 
-def _note_ls(args) -> int:
+def _notebook_ls(args) -> int:
   c = _client_from_args(args)
   pairs = api.list_notes(c, folder_path="Note", recursive=True)
   if args.days_ago is not None:
@@ -629,18 +681,18 @@ def _note_ls(args) -> int:
   basenames = [n.file_name for _, n in pairs]
   collisions = {b for b in basenames if basenames.count(b) > 1}
   for fp, n in pairs:
-    mtime = n.update_time.strftime("%Y-%m-%d %H:%M")
+    mtime = _ls_format_time(n.update_time)
     name = n.file_name[:-5] if n.file_name.endswith(".note") else n.file_name
     if n.file_name in collisions:
       rel = fp[len("Note"):].lstrip("/")
       label = f"{rel}/{name}" if rel else name
     else:
       label = name
-    print(f"{mtime}  {label}")
+    print(f" {n.id}  {mtime}  {label}")
   return 0
 
 
-def _note_show(args) -> int:
+def _notebook_show(args) -> int:
   c = _client_from_args(args)
   try:
     note = api.resolve_note(c, args.target)
@@ -661,7 +713,7 @@ def _note_show(args) -> int:
       return 2
 
   if args.as_json:
-    rec = _note_json_record(c, file_id, args)
+    rec = _notebook_json_record(c, file_id, args)
     print(json.dumps(rec, indent=2))
     return 0
 
@@ -684,7 +736,7 @@ def _note_show(args) -> int:
   return 0
 
 
-def _note_json_record(c, file_id, args) -> list[dict]:
+def _notebook_json_record(c, file_id, args) -> list[dict]:
   """Build the v0.2-shaped per-page JSON for a .note."""
   marquee = _Marquee()
   try:
@@ -761,9 +813,11 @@ _DISPATCH = {
   "upload": _cmd_upload,
   "delete": _cmd_delete,
   "sync": _cmd_sync,
-  "digest": _cmd_digest,
+  "annotation": _cmd_annotation,
+  "an": _cmd_annotation,
   "source": _cmd_source,
-  "note": _cmd_note,
+  "notebook": _cmd_notebook,
+  "nb": _cmd_notebook,
 }
 
 

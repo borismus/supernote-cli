@@ -789,9 +789,9 @@ def _digest_output_mode(output: str | os.PathLike) -> tuple[bool, Path]:
   return (p.suffix.lower() == ".png", p)
 
 
-def _digest_cache_md_path(output: str | os.PathLike) -> Path:
+def _digest_cache_md_path(output: str | os.PathLike, digest_id: str) -> Path:
   is_file, p = _digest_output_mode(output)
-  return p.with_suffix(".md") if is_file else p / "content.md"
+  return p.with_suffix(".md") if is_file else p / f"{digest_id}.md"
 
 
 def _digest_target_for_render(
@@ -830,7 +830,7 @@ def render_digest_markdown(
   output: str | os.PathLike | None = None,
   *,
   ocr_model: str = _ocr.DEFAULT_MODEL,
-  ocr_engine: str = "supernote",
+  ocr_engine: str = "none",
   force: bool = False,
   extra_prompt: str | None = None,
   on_page_start: Callable[[int, int], None] | None = None,
@@ -848,16 +848,18 @@ def render_digest_markdown(
     - otherwise: directory; PNGs written as `{digest_id}.png` /
       `{digest_id}_p{N}.png` inside.
     The returned markdown includes `![](...)` image refs pointing at
-    the persisted file(s). With `ocr_engine="ollama"`, `content.md`
-    is also written next to the PNG(s) (or as `{stem}.md` in file
-    mode) as a cache marker.
+    the persisted file(s). With `ocr_engine="ollama"`, a per-digest
+    cache md is also written: `{digest_id}.md` in dir mode, `{stem}.md`
+    in file mode.
 
   `ocr_engine`:
-    - "supernote" (default): no annotation transcription (Supernote's
-      device OCR doesn't cover digest handwriting). When `output` is
+    - "none" (default): no annotation transcription. When `output` is
       set and handwriting exists, the body shows `_(no transcript)_`
       next to the image; without `output`, no placeholder is shown.
     - "ollama": runs Ollama vision OCR on the PNG(s).
+    - "supernote" is also accepted and treated as "none" for back
+      compat with older callers (the device's on-tablet OCR doesn't
+      cover digest handwriting). New callers should pass "none".
 
   Progress callbacks (both optional) — same shape as ocr_note.
   """
@@ -866,7 +868,7 @@ def render_digest_markdown(
   needs_pngs = has_hw and (output is not None or use_ollama)
 
   if output is not None and use_ollama and not force:
-    cache_md = _digest_cache_md_path(output)
+    cache_md = _digest_cache_md_path(output, digest.id)
     if cache_md.exists():
       return cache_md.read_text()
 
@@ -887,7 +889,10 @@ def render_digest_markdown(
       work_dir.mkdir(parents=True, exist_ok=True)
       rendered = render_handwriting(client, digest, work_dir, force=force)
       finals, image_refs = _digest_target_for_render(output, rendered, digest.id)
-      _rename_to_targets(rendered, finals, force=force)
+      # File mode: the user named a specific output path, so always overwrite
+      # if it exists. Dir mode keeps the existence-as-cache convention so
+      # repeated runs into the same dir don't redundantly rewrite PNGs.
+      _rename_to_targets(rendered, finals, force=force or is_file)
       if use_ollama:
         ocr_body = _run_ollama_on_pages(
           finals, ocr_model, extra_prompt, on_page_start, on_token
@@ -899,7 +904,7 @@ def render_digest_markdown(
   md = _compose_digest_markdown(digest.content or "", ocr_body, image_refs)
 
   if output is not None and use_ollama:
-    cache_md = _digest_cache_md_path(output)
+    cache_md = _digest_cache_md_path(output, digest.id)
     cache_md.parent.mkdir(parents=True, exist_ok=True)
     cache_md.write_text(md)
 
