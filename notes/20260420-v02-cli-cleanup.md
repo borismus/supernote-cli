@@ -2,6 +2,9 @@
 
 **Date:** 2026-04-20
 
+> **Partially superseded by [20260509-v03-v04-min-by-default-and-rename.md](20260509-v03-v04-min-by-default-and-rename.md).**
+> Specifically, the "OCR is default-on" principle below was reversed in v0.3 (minimal defaults, OCR opt-in via `--ocr ollama`); the `digest`/`note` subcommand names were renamed to `annotation`/`notebook` in v0.4; and the "paths, not ids" preference was relaxed to favor IDs once `ls` outputs surfaced them. Endpoint reverse-engineering (upload, delete) and JSON field terminology (`digest`/`annotation`/`handwritten_image`) still apply.
+
 ## Why
 
 The v0.1 CLI accreted inconsistencies: three spellings of the output flag
