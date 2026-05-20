@@ -13,7 +13,9 @@ brew install pkg-config cairo
 Then install the project:
 
 ```
-uv tool install git+https://github.com/borismus/supernote-cli  # once published
+uv tool install supernote-cli
+# or:
+pip install supernote-cli
 # or from a local checkout:
 cd supernote-cli && uv sync
 ```
@@ -154,7 +156,7 @@ $ supernote nb ls --limit 5
 1254057731111780353  Apr 24 08:11  San Francisco Note, April 20
 1254579462477971456  Apr 27 07:36  20260424_081053
 1256465358412316672  May  1 07:39  20260429_132435
-1258756940570296320  May  5 21:10  Eliana 2
+1258756940570296320  May  5 21:10  Project Notes
 1257109318499565568  May  5 21:21  20260501_073927
 $ supernote notebook 1257109318499565568
 ## Page 1
@@ -255,12 +257,17 @@ for p in pages:
 
 ## Status
 
-- v0.4 (breaking): subcommands renamed for clarity. `note <id>` → `notebook <id>` (alias `nb`); `digest <id>` → `annotation <id>` (alias `an`). `annotation <id>` is OCR-off by default — pass bare `--ocr` (boolean) to transcribe via Ollama. `notebook ls` adds a leading id column (`{id}  {date}  {name}`). `annotation ls` becomes 4 columns (`{id}  {date}  {doc-name}  {fragment}`). `annotation`'s dir-mode cache markdown is now keyed by id (`{annotation_id}.md` instead of `content.md`) so separate single-id runs into the same dir don't collide. The untranscribed-handwriting stderr hint is now `Note: annotation <id> has untranscribed digest; pass --ocr to transcribe (or -o PATH to save the PNG)`.
-- v0.3 (breaking): `digest <id>` / `note <id>` defaults are minimal — no PNGs persisted, no Ollama. Stdout is just the blockquote (digest) or the device transcript per page (note). Pass `-o PATH` to persist PNGs (digest accepts `file.png` or a dir; note accepts a dir). Pass `--ocr {supernote,ollama}` (default `supernote`) to control transcription; `--ocr ollama` runs vision OCR (replacing the old `--no-ocr` boolean). When a digest has untranscribed handwriting and no flags pull it, a one-line hint is printed to stderr. `--dir` renamed to `-o/--output`. `note <TARGET>` now accepts a basename (e.g. `20260501_073927` with or without `.note`), a full path (`Note/sub/foo.note`), or a numeric id; `note ls` shows `mtime  name`, sorted newest-last. `render_digest_markdown` and `render_note_markdown` take an optional `output` arg and `ocr_engine="supernote"|"ollama"`. `render_handwriting` writes `{digest_id}.png` / `{digest_id}_pN.png`. New API: `api.resolve_note(client, target)` returns the matching `Note` (raises `NoteNotFound` / `NoteAmbiguous`).
-- v0.2 (breaking): standardized `-o/--output` across commands, path-based `download` / `delete` (with `--by-id` fallback), JSON-always output for `digest <id>` / `note <id>` using Supernote terms (`digest` / `annotation` / `handwritten_image`), new `upload` and `delete` verbs.
+- **v0.3.0 (first PyPI release)** — combines two internal milestones (see [notes/20260509-v03-v04-min-by-default-and-rename.md](notes/20260509-v03-v04-min-by-default-and-rename.md) for the design rationale):
+  - **Minimal-by-default.** `annotation <id>` / `notebook <id>` print the blockquote (annotation) or device transcript per page (notebook) and quit — no PNGs persisted, no Ollama call. Pass `-o PATH` to persist PNGs (`annotation` accepts `file.png` or a dir; `notebook` accepts a dir). Pass `--ocr` (annotation: boolean) or `--ocr {supernote,ollama}` (notebook, default `supernote`) to control transcription; `--ocr ollama` runs vision OCR. When an annotation has untranscribed handwriting and no flags pull it, a one-line stderr hint fires: `Note: annotation <id> has untranscribed digest; pass --ocr to transcribe (or -o PATH to save the PNG)`.
+  - **Subcommand rename for clarity.** `note <id>` → `notebook <id>` (alias `nb`); `digest <id>` → `annotation <id>` (alias `an`). The Python API keeps the original names (`render_digest_markdown`, `Digest` dataclass, `list_digested_sources`) — see the design note for why.
+  - **Listing redesign.** Both `notebook ls` and `annotation ls` lead with the snowflake id. `notebook ls` is `{id}  {mtime}  {name}`, sorted oldest-first. `annotation ls` groups by source document, with `(A)` markers on rows that have handwriting on top. macOS `ls -l`-style timestamps throughout.
+  - **Addressing.** `notebook <TARGET>` accepts a basename (e.g. `20260501_073927` with or without `.note`), a full path (`Note/sub/foo.note`), or a numeric id. New API: `api.resolve_note(client, target)` returns the matching `Note` (raises `NoteNotFound` / `NoteAmbiguous`).
+  - **Cache md keying.** Annotation dir-mode cache is `{annotation_id}.md` (was `content.md`) so separate single-id runs into the same dir don't collide. Notebook stays `content.md` (single-target by construction).
+  - **API surface.** `render_digest_markdown` / `render_note_markdown` take an optional `output` arg and `ocr_engine="supernote"|"ollama"`. `render_handwriting` writes `{digest_id}.png` / `{digest_id}_pN.png`.
+- v0.2 (pre-PyPI, breaking): standardized `-o/--output` across commands, path-based `download` / `delete` (with `--by-id` fallback), JSON-always output for `digest <id>` / `note <id>` using Supernote terms (`digest` / `annotation` / `handwritten_image`), new `upload` and `delete` verbs.
 - `.note` OCR: `list_notes`, `render_note`, `extract_note_text`, `ocr_note` (local file), `ocr_note_from_cloud` (by file id), `ocr_image` in `supernote_cli.api` / `supernote_cli.ocr`.
 - Upload: `api.upload_file(client, local_path, remote_dir, overwrite=False)` and `supernote upload` CLI. Implements Supernote's `file/upload/apply` → signed S3 PUT → `file/upload/finish` flow; `remote_dir` must already exist (no auto-mkdir).
-- Not yet on PyPI. Install via `uv tool install git+https://github.com/borismus/supernote-cli` or add a local path dep (`{ path = "…", editable = true }`). Planned to publish after living with the API for a bit — see the publish playbook in [docs/publishing.md](docs/publishing.md).
+- Release playbook: see [docs/publishing.md](docs/publishing.md).
 
 ## Tests
 

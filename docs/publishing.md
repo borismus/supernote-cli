@@ -1,6 +1,6 @@
 # Publishing to PyPI
 
-Not yet published. When ready, follow the steps below.
+Step-by-step playbook for cutting a release. First release was v0.3.0.
 
 ## One-time account setup
 
