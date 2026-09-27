@@ -459,7 +459,7 @@ class NotePage:
   index: int  # 1-based
   png_path: Path
   transcript: str | None  # supernotelib device-OCR (may be None)
-  ocr_text: str | None  # local Ollama OCR (None if disabled/failed)
+  ocr_text: str | None  # vision-model OCR (None if disabled/failed)
 
 
 def render_note(
@@ -526,13 +526,13 @@ def ocr_note(
   """Render a `.note` file's pages, pull device transcripts, OCR each page.
 
   Bundles `render_note` + `extract_note_text` + `ocr_image` into one call.
-  If Ollama is unreachable, `ocr_text` is None on every page but the rest
+  If the OCR server is unreachable, `ocr_text` is None on every page but the rest
   of the record is still populated. `extra_prompt` is forwarded to
   `ocr_image` for project-specific transcription rules.
 
   Two structured progress callbacks (both optional):
     on_page_start(page_index, total_pages): once per page before OCR.
-    on_token(delta): per Ollama streaming chunk (also includes any
+    on_token(delta): once per page with that page's finished text (the
       thinking text the model emits). Returned string is unaffected.
   """
   png_paths = render_note(note_path, out_dir, force=force)
@@ -706,7 +706,7 @@ def _compose_note_markdown(
 ) -> str:
   """Build note markdown: one ## Page N section per page.
 
-  Prefers Ollama OCR text when present, otherwise falls back to the
+  Prefers vision-model OCR text when present, otherwise falls back to the
   device transcript. If both are empty and `empty_placeholder` is
   given, the placeholder is shown in the page body. When `image_refs`
   is given (parallel to `pages`), each section ends with an
@@ -839,7 +839,7 @@ def render_digest_markdown(
   """Build the stdout-equivalent markdown for a digest.
 
   When `output` is None, no PNG persists — the blockquote is the only
-  text output, and Ollama (if engaged via `ocr_engine="ollama"`) runs
+  text output, and the vision model (if engaged via `ocr_engine="vlm"`) runs
   against a tempdir-rendered PNG that is then discarded.
 
   When `output` is given:
@@ -848,7 +848,7 @@ def render_digest_markdown(
     - otherwise: directory; PNGs written as `{digest_id}.png` /
       `{digest_id}_p{N}.png` inside.
     The returned markdown includes `![](...)` image refs pointing at
-    the persisted file(s). With `ocr_engine="ollama"`, a per-digest
+    the persisted file(s). With `ocr_engine="vlm"`, a per-digest
     cache md is also written: `{digest_id}.md` in dir mode, `{stem}.md`
     in file mode.
 
@@ -856,18 +856,18 @@ def render_digest_markdown(
     - "none" (default): no annotation transcription. When `output` is
       set and handwriting exists, the body shows `_(no transcript)_`
       next to the image; without `output`, no placeholder is shown.
-    - "ollama": runs Ollama vision OCR on the PNG(s).
+    - "vlm": runs vision-model OCR on the PNG(s).
     - "supernote" is also accepted and treated as "none" for back
       compat with older callers (the device's on-tablet OCR doesn't
       cover digest handwriting). New callers should pass "none".
 
   Progress callbacks (both optional) — same shape as ocr_note.
   """
-  use_ollama = ocr_engine == "ollama"
+  use_vlm = ocr_engine == "vlm"
   has_hw = digest.has_annotation
-  needs_pngs = has_hw and (output is not None or use_ollama)
+  needs_pngs = has_hw and (output is not None or use_vlm)
 
-  if output is not None and use_ollama and not force:
+  if output is not None and use_vlm and not force:
     cache_md = _digest_cache_md_path(output, digest.id)
     if cache_md.exists():
       return cache_md.read_text()
@@ -879,8 +879,8 @@ def render_digest_markdown(
     if output is None:
       with tempfile.TemporaryDirectory() as td:
         rendered = render_handwriting(client, digest, td, force=force)
-        if use_ollama:
-          ocr_body = _run_ollama_on_pages(
+        if use_vlm:
+          ocr_body = _run_vlm_on_pages(
             rendered, ocr_model, extra_prompt, on_page_start, on_token
           )
     else:
@@ -893,8 +893,8 @@ def render_digest_markdown(
       # if it exists. Dir mode keeps the existence-as-cache convention so
       # repeated runs into the same dir don't redundantly rewrite PNGs.
       _rename_to_targets(rendered, finals, force=force or is_file)
-      if use_ollama:
-        ocr_body = _run_ollama_on_pages(
+      if use_vlm:
+        ocr_body = _run_vlm_on_pages(
           finals, ocr_model, extra_prompt, on_page_start, on_token
         )
 
@@ -903,7 +903,7 @@ def render_digest_markdown(
 
   md = _compose_digest_markdown(digest.content or "", ocr_body, image_refs)
 
-  if output is not None and use_ollama:
+  if output is not None and use_vlm:
     cache_md = _digest_cache_md_path(output, digest.id)
     cache_md.parent.mkdir(parents=True, exist_ok=True)
     cache_md.write_text(md)
@@ -911,14 +911,14 @@ def render_digest_markdown(
   return md
 
 
-def _run_ollama_on_pages(
+def _run_vlm_on_pages(
   paths: list[Path],
   model: str,
   extra_prompt: str | None,
   on_page_start: Callable[[int, int], None] | None,
   on_token: Callable[[str], None] | None,
 ) -> str:
-  """Run Ollama OCR on each PNG; return joined non-empty results, or the
+  """Run vision OCR on each PNG; return joined non-empty results, or the
   no-transcript placeholder if every page came back empty."""
   total = len(paths)
   parts: list[str] = []
@@ -969,18 +969,18 @@ def render_note_markdown(
   """Build the stdout-equivalent markdown for a cloud `.note` file.
 
   When `output` is None, no PNGs persist. The text comes from the
-  device transcript per page (or Ollama OCR if `ocr_engine="ollama"`,
+  device transcript per page (or vision OCR if `ocr_engine="vlm"`,
   which renders to a tempdir, OCRs, and discards). Pages with no
   transcript render as `_(no transcript)_`.
 
   When `output` (a directory) is given, `page_{N}.png` files are
   written into it and the returned markdown includes per-page
-  `![](output/page_N.png)` refs. With `ocr_engine="ollama"`,
+  `![](output/page_N.png)` refs. With `ocr_engine="vlm"`,
   `content.md` is written into `output` as a cache marker.
   """
-  use_ollama = ocr_engine == "ollama"
+  use_vlm = ocr_engine == "vlm"
 
-  if output is not None and use_ollama and not force:
+  if output is not None and use_vlm and not force:
     cached = Path(output) / "content.md"
     if cached.exists():
       return cached.read_text()
@@ -988,7 +988,7 @@ def render_note_markdown(
   pages: list[NotePage]
   image_refs: list[str] = []
 
-  if output is None and not use_ollama:
+  if output is None and not use_vlm:
     # Lightest path: just download .note, extract transcripts. No PNGs.
     with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
       download_file(client, file_id, Path(tmp.name))
@@ -1002,7 +1002,7 @@ def render_note_markdown(
       )
       for i, t in enumerate(transcripts)
     ]
-  elif output is None and use_ollama:
+  elif output is None and use_vlm:
     # OCR path without persistence: render to tempdir, OCR, discard.
     with tempfile.TemporaryDirectory() as td:
       tdp = Path(td)
@@ -1015,7 +1015,7 @@ def render_note_markdown(
     # Output given: persist PNGs.
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
-    if use_ollama:
+    if use_vlm:
       pages = ocr_note_from_cloud(
         client, file_id, out,
         model=ocr_model, force=force, extra_prompt=extra_prompt,
@@ -1040,6 +1040,6 @@ def render_note_markdown(
 
   md = _compose_note_markdown(pages, image_refs, empty_placeholder=NO_TRANSCRIPT_PLACEHOLDER)
 
-  if output is not None and use_ollama:
+  if output is not None and use_vlm:
     (Path(output) / "content.md").write_text(md)
   return md

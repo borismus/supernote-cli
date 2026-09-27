@@ -49,11 +49,11 @@ supernote source ls [--days-ago N] [--limit N] [--json]
 
 supernote annotation ls [--limit N] [--days-ago N] [--json]   # alias: an
 supernote annotation <id> \                                   # blockquote to stdout; nothing written
-         [-o PATH] [--ocr {none,ollama}] [--model M] [--force] [--json] [--prompt TEXT]
+         [-o PATH] [--ocr {none,vlm}] [--model M] [--force] [--json] [--prompt TEXT]
 
 supernote notebook ls [--days-ago N] [--limit N] [--json]     # alias: nb
 supernote notebook <id|name|path> \                           # device transcript to stdout; nothing written
-         [-o DIR] [--ocr {supernote,ollama}] [--model M] [--force] [--json] [--prompt TEXT]
+         [-o DIR] [--ocr {supernote,vlm}] [--model M] [--force] [--json] [--prompt TEXT]
 ```
 
 Global flags: `--no-cache`, `--verbose`, `--equipment-no`.
@@ -64,7 +64,7 @@ Most commands take a remote path (`Note/Inbox/foo.note`). `download` and `delete
 
 ### `annotation <id>` (alias `an`) — blockquote to stdout; `-o` for the PNG, `--ocr` for LLM transcription
 
-By default, `annotation <id>` prints just the highlighted passage. Nothing is written to disk and no Ollama call is made:
+By default, `annotation <id>` prints just the highlighted passage. Nothing is written to disk and no model call is made:
 
 ```
 $ supernote annotation 832783777540341760
@@ -111,7 +111,7 @@ _(no transcript)_
 
 In dir mode the markdown cache is keyed by id too — `{output}/{annotation_id}.md` — so separate single-id runs into the same dir don't overwrite each other.
 
-Pass `--ocr` to transcribe the handwriting via local Ollama vision OCR. With `-o`, the OCR text replaces the placeholder and a sibling `{annotation_id}.md` (file mode: `{stem}.md`) is written as a cache marker:
+Pass `--ocr` to transcribe the handwriting via vision OCR. With `-o`, the OCR text replaces the placeholder and a sibling `{annotation_id}.md` (file mode: `{stem}.md`) is written as a cache marker:
 
 ```
 $ supernote annotation 832783777540341760 --ocr -o ann.png
@@ -141,7 +141,7 @@ Pass `--json` for the structured shape:
 
 Multiple comma-separated IDs print one block per annotation (or a JSON array). `-o file.png` requires a single id; `-o dir/ --ocr` is also single-id today.
 
-### `notebook <id|name|path>` (alias `nb`) — device transcript to stdout; `-o` for page PNGs, `--ocr ollama` for LLM transcription
+### `notebook <id|name|path>` (alias `nb`) — device transcript to stdout; `-o` for page PNGs, `--ocr vlm` for LLM transcription
 
 The target is resolved in this order:
 
@@ -173,7 +173,7 @@ $ supernote notebook 1257109318499565568
 
 Pass `-o DIR` to also render and persist `page_N.png` into `DIR`. The markdown then includes per-page `![](DIR/page_N.png)` refs.
 
-Pass `--ocr ollama` to run local Ollama vision OCR per page instead of the device transcript (higher quality, slower, requires Ollama). With `-o`, `content.md` is written into the dir as a cache marker; without `-o`, PNGs render to a tempdir and are discarded after OCR.
+Pass `--ocr vlm` to run vision OCR per page instead of the device transcript (higher quality, slower, requires an OCR server — see below). With `-o`, `content.md` is written into the dir as a cache marker; without `-o`, PNGs render to a tempdir and are discarded after OCR.
 
 Pass `--json` for the v0.2 per-page structured array:
 
@@ -182,7 +182,7 @@ Pass `--json` for the v0.2 per-page structured array:
   {
     "page": 1,
     "transcript": "device OCR text from supernotelib",
-    "annotation": "Ollama OCR text (null without --ocr ollama)",
+    "annotation": "OCR text (null without --ocr vlm)",
     "handwritten_image": "MyNotebook/page_1.png"
   }
 ]
@@ -194,24 +194,31 @@ The two subcommands have different `--ocr` shapes — what makes sense for each 
 
 | Subcommand | Flag shape | Default | Notes |
 |---|---|---|---|
-| `notebook` | `--ocr {supernote,ollama}` | `supernote` | `supernote` = per-page device transcript via `extract_note_text`; `ollama` = per-page Ollama vision OCR (replaces device transcript) |
-| `annotation` | `--ocr` (boolean) | off | Off: no transcription, body has only the blockquote (with `_(no transcript)_` next to the image when `-o` is set and handwriting exists). On: Ollama vision OCR of the rendered handwriting PNG. |
+| `notebook` | `--ocr {supernote,vlm}` | `supernote` | `supernote` = per-page device transcript via `extract_note_text`; `vlm` = per-page vision OCR (replaces device transcript) |
+| `annotation` | `--ocr` (boolean) | off | Off: no transcription, body has only the blockquote (with `_(no transcript)_` next to the image when `-o` is set and handwriting exists). On: vision OCR of the rendered handwriting PNG. |
 
-The shapes differ because notebooks have two meaningful engines (device vs Ollama), while annotations only have one (the device doesn't OCR digest handwriting).
+The shapes differ because notebooks have two meaningful engines (device vs vision model), while annotations only have one (the device doesn't OCR digest handwriting).
 
 ### Custom OCR prompt
 
-`--prompt TEXT` (only meaningful when Ollama OCR is engaged: `--ocr ollama` for `notebook`, `--ocr` for `annotation`) layers project-specific transcription rules on top of the default OCR prompt. Useful for preserving inline markers verbatim:
+`--prompt TEXT` (only meaningful when vision OCR is engaged: `--ocr vlm` for `notebook`, `--ocr` for `annotation`) layers project-specific transcription rules on top of the default OCR prompt. Useful for preserving inline markers verbatim:
 
 ```
-$ supernote notebook <id> --ocr ollama --prompt "When a line begins with → or ☐, transcribe it verbatim including the leading symbol; preserve multi-line continuation."
+$ supernote notebook <id> --ocr vlm --prompt "When a line begins with → or ☐, transcribe it verbatim including the leading symbol; preserve multi-line continuation."
 ```
 
 The text is appended under an `Additional instructions:` section after the default OCR prompt. **The cache markdown does not track the prompt** (notebook: `content.md`; annotation: `{annotation_id}.md`). If you change the prompt and want fresh output, pass `--force` to invalidate.
 
-### Ollama
+### OCR server
 
-Default model is `qwen3-vl:8b`; change with `--model`. If Ollama returns an error mid-run (e.g. model not pulled), the CLI surfaces the error to stderr once and emits `annotation: null` for remaining items — partial results still print. Use `OLLAMA_HOST` to point at a non-default daemon.
+OCR goes to any OpenAI-compatible server exposing `/v1/chat/completions` with image content parts (an MLX server on another Mac, llama.cpp, vLLM). Configure it with:
+
+    SUPERNOTE_OCR_BASE_URL=http://your-host:8000/v1
+    SUPERNOTE_OCR_API_KEY=...          # only if the server requires one
+
+Default model is `Qwen3.8-27B-MLX-4bit`; change with `--model`. Requests retry on connection errors and 5xx before giving up, so a server that briefly drops off the network doesn't turn into an empty transcription. If OCR fails mid-run the CLI surfaces the error to stderr once and emits `annotation: null` for remaining items — partial results still print.
+
+Note that these prompts carry the full text of your handwritten notes, so point this at a model running on hardware you control.
 
 ## Library
 
@@ -229,9 +236,9 @@ for folder_path, note in api.list_notes(c):
 #   PathLike       → PNG(s) written; markdown includes image refs.
 #                    For digests, suffix `.png` selects file mode.
 md = api.render_digest_markdown(c, digest)                         # just the blockquote
-md = api.render_digest_markdown(c, digest, "ann.png", ocr_engine="ollama")  # PNG + Ollama
+md = api.render_digest_markdown(c, digest, "ann.png", ocr_engine="vlm")  # PNG + vision OCR
 md = api.render_note_markdown(c, file_id)                          # device transcripts only
-md = api.render_note_markdown(c, file_id, "/tmp/mynote", ocr_engine="ollama")  # PNGs + Ollama
+md = api.render_note_markdown(c, file_id, "/tmp/mynote", ocr_engine="vlm")  # PNGs + vision OCR
 
 # Group digests by source document (PDF/EPUB) and get full Digest records
 for src in api.list_digested_sources(c, days_ago=30):
@@ -247,23 +254,23 @@ note = api.upload_file(c, "~/book.pdf", "Document/Books/")
 print(note.id, note.file_name)
 api.delete_file(c, note)
 
-# Download + render + Ollama-OCR a .note by cloud id
+# Download + render + OCR a .note by cloud id
 pages = api.ocr_note_from_cloud(c, "1138647043762290688", "/tmp/wh")
 for p in pages:
     print(p.index, p.ocr_text)
 ```
 
-`Client` handles auth transparently: an expired token triggers a re-login if `.env` credentials are available. Rendering uses `supernotelib` + `pillow` (main deps); OCR talks to a local Ollama daemon.
+`Client` handles auth transparently: an expired token triggers a re-login if `.env` credentials are available. Rendering uses `supernotelib` + `pillow` (main deps); OCR talks to an OpenAI-compatible vision server.
 
 ## Status
 
 - **v0.3.0 (first PyPI release)** — combines two internal milestones (see [notes/20260509-v03-v04-min-by-default-and-rename.md](notes/20260509-v03-v04-min-by-default-and-rename.md) for the design rationale):
-  - **Minimal-by-default.** `annotation <id>` / `notebook <id>` print the blockquote (annotation) or device transcript per page (notebook) and quit — no PNGs persisted, no Ollama call. Pass `-o PATH` to persist PNGs (`annotation` accepts `file.png` or a dir; `notebook` accepts a dir). Pass `--ocr` (annotation: boolean) or `--ocr {supernote,ollama}` (notebook, default `supernote`) to control transcription; `--ocr ollama` runs vision OCR. When an annotation has untranscribed handwriting and no flags pull it, a one-line stderr hint fires: `Note: annotation <id> has untranscribed digest; pass --ocr to transcribe (or -o PATH to save the PNG)`.
+  - **Minimal-by-default.** `annotation <id>` / `notebook <id>` print the blockquote (annotation) or device transcript per page (notebook) and quit — no PNGs persisted, no OCR call. Pass `-o PATH` to persist PNGs (`annotation` accepts `file.png` or a dir; `notebook` accepts a dir). Pass `--ocr` (annotation: boolean) or `--ocr {supernote,vlm}` (notebook, default `supernote`) to control transcription; `--ocr vlm` runs vision OCR. When an annotation has untranscribed handwriting and no flags pull it, a one-line stderr hint fires: `Note: annotation <id> has untranscribed digest; pass --ocr to transcribe (or -o PATH to save the PNG)`.
   - **Subcommand rename for clarity.** `note <id>` → `notebook <id>` (alias `nb`); `digest <id>` → `annotation <id>` (alias `an`). The Python API keeps the original names (`render_digest_markdown`, `Digest` dataclass, `list_digested_sources`) — see the design note for why.
   - **Listing redesign.** Both `notebook ls` and `annotation ls` lead with the snowflake id. `notebook ls` is `{id}  {mtime}  {name}`, sorted oldest-first. `annotation ls` groups by source document, with `(A)` markers on rows that have handwriting on top. macOS `ls -l`-style timestamps throughout.
   - **Addressing.** `notebook <TARGET>` accepts a basename (e.g. `20260501_073927` with or without `.note`), a full path (`Note/sub/foo.note`), or a numeric id. New API: `api.resolve_note(client, target)` returns the matching `Note` (raises `NoteNotFound` / `NoteAmbiguous`).
   - **Cache md keying.** Annotation dir-mode cache is `{annotation_id}.md` (was `content.md`) so separate single-id runs into the same dir don't collide. Notebook stays `content.md` (single-target by construction).
-  - **API surface.** `render_digest_markdown` / `render_note_markdown` take an optional `output` arg and `ocr_engine="supernote"|"ollama"`. `render_handwriting` writes `{digest_id}.png` / `{digest_id}_pN.png`.
+  - **API surface.** `render_digest_markdown` / `render_note_markdown` take an optional `output` arg and `ocr_engine="supernote"|"vlm"`. `render_handwriting` writes `{digest_id}.png` / `{digest_id}_pN.png`.
 - v0.2 (pre-PyPI, breaking): standardized `-o/--output` across commands, path-based `download` / `delete` (with `--by-id` fallback), JSON-always output for `digest <id>` / `note <id>` using Supernote terms (`digest` / `annotation` / `handwritten_image`), new `upload` and `delete` verbs.
 - `.note` OCR: `list_notes`, `render_note`, `extract_note_text`, `ocr_note` (local file), `ocr_note_from_cloud` (by file id), `ocr_image` in `supernote_cli.api` / `supernote_cli.ocr`.
 - Upload: `api.upload_file(client, local_path, remote_dir, overwrite=False)` and `supernote upload` CLI. Implements Supernote's `file/upload/apply` → signed S3 PUT → `file/upload/finish` flow; `remote_dir` must already exist (no auto-mkdir).

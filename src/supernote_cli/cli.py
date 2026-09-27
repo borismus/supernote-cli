@@ -43,7 +43,7 @@ class _Marquee:
 
   Callbacks the api layer fires:
     `marquee.page(index, total)` — called once per page before OCR starts.
-    `marquee.token(delta)` — called per Ollama streaming chunk.
+    `marquee.token(delta)` — called once per page with its finished text.
 
   Always call `marquee.close()` to stop the thread and clear both lines.
   """
@@ -191,7 +191,7 @@ def _build_parser() -> argparse.ArgumentParser:
     description=(
       "Run `annotation ls` to list annotation records. With an ID, "
       "print the blockquoted highlight to stdout. Pass `--ocr` to also "
-      "transcribe the handwriting via local Ollama vision OCR. Pass "
+      "transcribe the handwriting via vision OCR. Pass "
       "`-o PATH` to persist the handwriting PNG (and, with `--ocr`, "
       "a cache markdown) alongside."
     ),
@@ -225,11 +225,11 @@ def _build_parser() -> argparse.ArgumentParser:
     dest="ocr",
     action="store_true",
     help=(
-      "(id form) transcribe the handwriting via local Ollama vision OCR. "
+      "(id form) transcribe the handwriting via vision OCR. "
       "Default off — markdown body has just the blockquote."
     ),
   )
-  an.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  an.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr) vision model (default: {ocr.DEFAULT_MODEL})")
   an.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
   an.add_argument("--prompt", dest="prompt", help="(id form, with --ocr) extra OCR instructions appended to the default prompt")
 
@@ -240,8 +240,8 @@ def _build_parser() -> argparse.ArgumentParser:
     description=(
       "Run `notebook ls` to list .note files under /Note/. With a numeric "
       "file id, print the device-OCR transcript per page. Pass `-o DIR` to "
-      "also persist `page_N.png`; pass `--ocr ollama` to swap the device "
-      "transcript for Ollama vision OCR."
+      "also persist `page_N.png`; pass `--ocr vlm` to swap the device "
+      "transcript for vision OCR."
     ),
   )
   nb.add_argument("target", help="'ls' to list notebooks, or a target to fetch: numeric file id (recommended), basename (foo.note or foo), or full path (Note/sub/foo.note)")
@@ -260,18 +260,18 @@ def _build_parser() -> argparse.ArgumentParser:
     "-o", "--output",
     dest="output",
     default=None,
-    help="(id form) directory to write page_N.png (and content.md when --ocr ollama). Default: no PNGs persisted, transcripts only.",
+    help="(id form) directory to write page_N.png (and content.md when --ocr vlm). Default: no PNGs persisted, transcripts only.",
   )
   nb.add_argument(
     "--ocr",
     dest="ocr",
-    choices=("supernote", "ollama"),
+    choices=("supernote", "vlm"),
     default="supernote",
-    help="(id form) handwriting transcription engine. 'supernote' (default): use the device's on-tablet OCR transcript per page (pages with no transcript show '_(no transcript)_'). 'ollama': run local Ollama vision OCR per page.",
+    help="(id form) handwriting transcription engine. 'supernote' (default): use the device's on-tablet OCR transcript per page (pages with no transcript show '_(no transcript)_'). 'vlm': run vision-model OCR per page.",
   )
-  nb.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr ollama) Ollama vision model (default: {ocr.DEFAULT_MODEL})")
+  nb.add_argument("--model", default=ocr.DEFAULT_MODEL, help=f"(id form, with --ocr vlm) vision model (default: {ocr.DEFAULT_MODEL})")
   nb.add_argument("--force", action="store_true", help="(id form) re-render PNGs and re-OCR even if cached on disk")
-  nb.add_argument("--prompt", dest="prompt", help="(id form, with --ocr ollama) extra OCR instructions appended to the default prompt")
+  nb.add_argument("--prompt", dest="prompt", help="(id form, with --ocr vlm) extra OCR instructions appended to the default prompt")
 
   return p
 
@@ -501,8 +501,8 @@ def _annotation_ls(args) -> int:
 def _annotation_show(args) -> int:
   c = _client_from_args(args)
   ids = [i.strip() for i in args.target.split(",") if i.strip()]
-  use_ollama = bool(args.ocr)
-  ocr_engine = "ollama" if use_ollama else "none"
+  use_vlm = bool(args.ocr)
+  ocr_engine = "vlm" if use_vlm else "none"
 
   if args.output is not None and len(ids) > 1:
     is_file_mode = args.output.lower().endswith(".png")
@@ -512,17 +512,17 @@ def _annotation_show(args) -> int:
         file=sys.stderr,
       )
       return 2
-    if use_ollama:
+    if use_vlm:
       print(
         "error: multi-id with -o --ocr is unsupported; pass a single annotation id",
         file=sys.stderr,
       )
       return 2
 
-  if args.prompt and not use_ollama:
+  if args.prompt and not use_vlm:
     print("warning: --prompt has no effect without --ocr", file=sys.stderr)
 
-  if use_ollama:
+  if use_vlm:
     try:
       ocr.check_available()
     except ocr.OcrError as e:
@@ -566,7 +566,7 @@ def _annotation_show(args) -> int:
       if not md.endswith("\n"):
         sys.stdout.write("\n")
       # Surface untranscribed-digest hint when nothing pulls it.
-      if d.has_annotation and args.output is None and not use_ollama:
+      if d.has_annotation and args.output is None and not use_vlm:
         print(
           f"\nNote: annotation {d.id} has untranscribed digest; "
           "pass --ocr to transcribe (or -o PATH to save the PNG)",
@@ -584,7 +584,7 @@ def _annotation_json_record(c, digest, args) -> dict:
     md = api.render_digest_markdown(
       c, digest, args.output,
       ocr_model=args.model,
-      ocr_engine="ollama" if args.ocr else "none",
+      ocr_engine="vlm" if args.ocr else "none",
       force=args.force,
       extra_prompt=args.prompt,
       on_page_start=marquee.page,
@@ -700,12 +700,12 @@ def _notebook_show(args) -> int:
     print(f"error: {e}", file=sys.stderr)
     return 2
   file_id = note.id
-  use_ollama = args.ocr == "ollama"
+  use_vlm = args.ocr == "vlm"
 
-  if args.prompt and not use_ollama:
-    print("warning: --prompt has no effect without --ocr ollama", file=sys.stderr)
+  if args.prompt and not use_vlm:
+    print("warning: --prompt has no effect without --ocr vlm", file=sys.stderr)
 
-  if use_ollama:
+  if use_vlm:
     try:
       ocr.check_available()
     except ocr.OcrError as e:
@@ -758,12 +758,12 @@ def _notebook_json_record(c, file_id, args) -> list[dict]:
   with tempfile.NamedTemporaryFile(suffix=".note", delete=True) as tmp:
     api.download_file(c, file_id, Path(tmp.name))
     transcripts = api.extract_note_text(tmp.name)
-  use_ollama = args.ocr == "ollama"
+  use_vlm = args.ocr == "vlm"
   prefix = (args.output.rstrip("/") + "/") if args.output is not None else ""
   records = []
   for i, transcript in enumerate(transcripts):
     body = page_ocr.get(i + 1) or None
-    annotation = body if use_ollama else None
+    annotation = body if use_vlm else None
     image_ref = None
     if args.output is not None:
       png_name = f"page_{i + 1}.png"

@@ -1,18 +1,23 @@
-"""Local Ollama vision OCR for Supernote handwriting.
+"""Vision OCR for Supernote handwriting, via an OpenAI-compatible server.
 
-Calls a locally-running Ollama daemon (default http://localhost:11434)
-with a handwriting-tuned prompt. `ocr_image` raises `OcrError` on failure
-so callers can decide how to surface or downgrade.
+Point `SUPERNOTE_OCR_BASE_URL` at any server exposing `/v1/chat/completions`
+with image content parts — an MLX server on another Mac, llama.cpp, vLLM — and
+set `SUPERNOTE_OCR_API_KEY` if it needs one. Both can also be passed directly
+to `ocr_image`.
 
-Runtime dep: Ollama with a vision model pulled (default qwen3-vl:8b).
+These prompts carry the full text of private handwritten notes, so point this
+at a model on hardware you control.
+
+`ocr_image` raises `OcrError` on failure so callers can decide how to surface
+or downgrade.
 """
 
 from __future__ import annotations
 
 import base64
 import io
-import json
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -35,27 +40,67 @@ Critical constraints:
 - If you notice yourself repeating a word or phrase, immediately stop and output your best single transcription of the whole note.
 - Your entire response must be ONLY the final transcription text, nothing else."""
 
-DEFAULT_MODEL = "qwen3-vl:8b"
+DEFAULT_MODEL = "Qwen3.8-27B-MLX-4bit"
 DEFAULT_MAX_SIZE = 1024
 DEFAULT_TIMEOUT = 300
+# Generous: a dense page plus whatever a reasoning model spends thinking.
+# Hitting it raises rather than returning a truncated transcription.
+DEFAULT_MAX_TOKENS = 4096
+
+# The server may be on another machine that drops off the network briefly.
+# Callers collapse a failed page to "no text", which is indistinguishable from
+# a genuinely blank page — so retry here rather than let a blip look like an
+# empty note.
+RETRY_DELAYS = (2, 5, 15)
 
 
-def default_host() -> str:
-  return os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+def default_base_url() -> str | None:
+  return os.environ.get("SUPERNOTE_OCR_BASE_URL") or None
+
+
+def default_api_key() -> str | None:
+  return os.environ.get("SUPERNOTE_OCR_API_KEY") or None
 
 
 class OcrError(Exception):
-  """Raised when Ollama is unreachable or returns an error."""
+  """Raised when the OCR server is unreachable or returns an error."""
 
 
-def check_available(*, host: str | None = None, timeout: int = 5) -> None:
-  """Ping Ollama at `host/api/tags`. Raises `OcrError` on any failure."""
-  h = host or default_host()
-  try:
-    r = requests.get(f"{h}/api/tags", timeout=timeout)
-    r.raise_for_status()
-  except requests.RequestException as e:
-    raise OcrError(f"Ollama not reachable at {h}. Start Ollama or pass --no-ocr.") from e
+def _resolve(base_url: str | None, api_key: str | None) -> tuple[str, str | None]:
+  resolved = base_url or default_base_url()
+  if not resolved:
+    raise OcrError(
+      "No OCR server configured. Set SUPERNOTE_OCR_BASE_URL (and "
+      "SUPERNOTE_OCR_API_KEY if required), or pass base_url=."
+    )
+  return resolved, (api_key or default_api_key())
+
+
+def check_available(
+  *,
+  base_url: str | None = None,
+  api_key: str | None = None,
+  timeout: int = 15,
+) -> None:
+  """GET `{base_url}/models`. Raises `OcrError` if it stays unreachable.
+
+  Retries on the same schedule as a real request: a preflight check that gave
+  up faster than the work it guards would abort runs that would have succeeded.
+  """
+  resolved, key = _resolve(base_url, api_key)
+  headers = {"Authorization": f"Bearer {key}"} if key else {}
+  url = resolved.rstrip("/") + "/models"
+  last_error: Exception | None = None
+  for delay in (*RETRY_DELAYS, None):
+    try:
+      requests.get(url, headers=headers, timeout=timeout).raise_for_status()
+      return
+    except requests.RequestException as e:
+      last_error = e
+    if delay is None:
+      break
+    time.sleep(delay)
+  raise OcrError(f"OCR server not reachable at {resolved}.") from last_error
 
 
 def resize_for_ocr(image: Image.Image, max_size: int = DEFAULT_MAX_SIZE) -> Image.Image:
@@ -95,89 +140,84 @@ def ocr_base64(
   image_base64: str,
   *,
   model: str = DEFAULT_MODEL,
-  host: str | None = None,
+  base_url: str | None = None,
+  api_key: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
   extra_prompt: str | None = None,
   on_token: Callable[[str], None] | None = None,
 ) -> str:
-  """POST an already-base64-JPEG image to Ollama's chat endpoint.
+  """POST an already-base64-JPEG image as an image content part.
 
-  Returns the transcription string. Raises `OcrError` on transport error,
-  HTTP error, or unexpected response shape. `extra_prompt`, if provided,
-  is appended to the default OCR prompt under an "Additional instructions:"
-  section — useful for project-specific transcription rules.
+  Returns the transcription. Raises `OcrError` on transport error, HTTP error,
+  or unexpected response shape. `extra_prompt`, if provided, is appended to the
+  default OCR prompt under an "Additional instructions:" section — useful for
+  project-specific transcription rules.
 
-  When `on_token` is provided, the request is streamed and the callback
-  is invoked once per Ollama chunk with the text delta. The full string
-  is still returned. When `on_token` is None, behaves as a single
-  blocking POST (no streaming overhead).
+  The request is not streamed; `on_token`, if given, receives the finished text
+  in a single call, so a caller's progress UI updates once per page.
   """
-  streaming = on_token is not None
+  resolved, key = _resolve(base_url, api_key)
+
   payload = {
     "model": model,
     "messages": [
       {
         "role": "user",
-        "content": _build_prompt(extra_prompt),
-        "images": [image_base64],
+        "content": [
+          {"type": "text", "text": _build_prompt(extra_prompt)},
+          {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
+          },
+        ],
       }
     ],
-    "stream": streaming,
+    "max_tokens": DEFAULT_MAX_TOKENS,
   }
+  headers = {"Content-Type": "application/json"}
+  if key:
+    headers["Authorization"] = f"Bearer {key}"
+
+  url = resolved.rstrip("/") + "/chat/completions"
+  response = None
+  last_error = ""
+  for delay in (*RETRY_DELAYS, None):
+    try:
+      response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    except requests.RequestException as e:
+      last_error = f"request to {resolved} failed: {type(e).__name__}: {e}"
+    else:
+      if response.status_code == 200:
+        break
+      # 4xx is the request's fault (bad model, bad auth) and won't fix itself.
+      if response.status_code < 500:
+        raise OcrError(
+          f"OCR server returned HTTP {response.status_code}: {response.text[:300]}"
+        )
+      last_error = f"server returned HTTP {response.status_code}: {response.text[:200]}"
+
+    if delay is None:
+      raise OcrError(f"OCR failed after {len(RETRY_DELAYS) + 1} attempts — {last_error}")
+    time.sleep(delay)
+
   try:
-    response = requests.post(
-      f"{host or default_host()}/api/chat",
-      json=payload,
-      timeout=timeout,
-      stream=streaming,
+    choice = response.json()["choices"][0]
+  except (ValueError, KeyError, IndexError) as e:
+    raise OcrError(f"Unexpected OCR response shape: {response.text[:300]}") from e
+
+  # A reasoning model that runs out of budget mid-thought spills its scratchpad
+  # into `content`. Returning that would file the model's deliberation as if it
+  # were the transcription, so treat it as a failure instead.
+  if choice.get("finish_reason") == "length":
+    raise OcrError(
+      f"Model {model!r} hit the {DEFAULT_MAX_TOKENS}-token limit before finishing; "
+      f"the page may be unusually dense."
     )
-  except requests.RequestException as e:
-    raise OcrError(f"Ollama request failed: {type(e).__name__}: {e}") from e
 
-  if response.status_code != 200:
-    detail = response.text
-    try:
-      detail = response.json().get("error", detail)
-    except ValueError:
-      pass
-    raise OcrError(f"Ollama returned HTTP {response.status_code}: {detail}")
-
-  if not streaming:
-    try:
-      data = response.json()
-    except ValueError as e:
-      raise OcrError(f"Ollama returned non-JSON: {response.text[:200]}") from e
-    if "message" in data and "content" in data["message"]:
-      return data["message"]["content"].strip()
-    if "response" in data:
-      return data["response"].strip()
-    raise OcrError(f"Unexpected Ollama response shape: {data}")
-
-  # Streaming: each line is a JSON object with a partial message.content.
-  # Final chunk has done=true and may include a final aggregated message.
-  # All chunks (content + thinking) flow through on_token; only `content`
-  # deltas are appended to the returned string. Liveness UX (spinner /
-  # marquee / per-page headers) is the caller's responsibility — keeps
-  # this layer thin and lets the CLI render the way it wants.
-  parts: list[str] = []
-  for raw in response.iter_lines():
-    if not raw:
-      continue
-    try:
-      chunk = json.loads(raw)
-    except ValueError:
-      continue
-    msg = chunk.get("message") or {}
-    thinking = msg.get("thinking") or ""
-    delta = msg.get("content") or chunk.get("response") or ""
-    if thinking:
-      on_token(thinking)
-    if delta:
-      on_token(delta)
-      parts.append(delta)
-    if chunk.get("done"):
-      break
-  return "".join(parts).strip()
+  text = (choice.get("message", {}).get("content") or "").strip()
+  if on_token and text:
+    on_token(text)
+  return text
 
 
 def ocr_image(
@@ -185,29 +225,25 @@ def ocr_image(
   *,
   model: str = DEFAULT_MODEL,
   max_size: int = DEFAULT_MAX_SIZE,
-  host: str | None = None,
+  base_url: str | None = None,
+  api_key: str | None = None,
   timeout: int = DEFAULT_TIMEOUT,
   extra_prompt: str | None = None,
   on_token: Callable[[str], None] | None = None,
 ) -> str:
-  """Run OCR on an image path or PIL Image via local Ollama vision.
+  """Run OCR on an image path or PIL Image.
 
-  Raises `OcrError` on any failure. `extra_prompt` is appended to the
-  default OCR prompt — used for project-specific transcription rules
-  (e.g. "preserve lines starting with → or ☐ verbatim"). When `on_token`
-  is provided, the call streams from Ollama and invokes the callback
-  per chunk so callers can render progress as it arrives.
+  Raises `OcrError` on any failure. `extra_prompt` is appended to the default
+  OCR prompt — used for project-specific transcription rules (e.g. "preserve
+  lines starting with → or ☐ verbatim").
   """
-  if isinstance(image, (str, Path)):
-    img = Image.open(image)
-  else:
-    img = image
+  img = Image.open(image) if isinstance(image, (str, Path)) else image
   img = resize_for_ocr(img, max_size=max_size)
-  payload = image_to_base64_jpeg(img)
   return ocr_base64(
-    payload,
+    image_to_base64_jpeg(img),
     model=model,
-    host=host,
+    base_url=base_url,
+    api_key=api_key,
     timeout=timeout,
     extra_prompt=extra_prompt,
     on_token=on_token,
